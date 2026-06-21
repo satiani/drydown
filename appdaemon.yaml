@@ -1,0 +1,39 @@
+---
+# Reference appdaemon.yaml for the AppDaemon add-on.
+#
+# This is NOT used directly — the add-on ships its own appdaemon.yaml at
+# /addon_configs/a0d7b954_appdaemon/appdaemon.yaml that already injects the
+# HA token via SUPERVISOR_TOKEN. This file exists only to document the
+# expected shape and to serve as a reference if the add-on's config is ever
+# lost and needs rebuilding.
+#
+# The add-on's working appdaemon.yaml looks like this (token auto-injected,
+# no ha_url or token needed from you):
+#
+# appdaemon:
+#   latitude: 40.683497
+#   longitude: -73.9797101
+#   elevation: 0
+#   time_zone: America/New_York
+#   plugins:
+#     HASS:
+#       type: hass
+#       token: !env_var SUPERVISOR_TOKEN
+# http:
+#   url: http://0.0.0.0:5050
+# admin:
+# api:
+# hadashboard:
+#
+# AppDaemon reads apps from the `apps/` directory next to this file by default.
+# No app_dir override is needed.
+
+appdaemon:
+  latitude: 40.683497
+  longitude: -73.9797101
+  elevation: 0
+  time_zone: America/New_York
+  plugins:
+    HASS:
+      type: hass
+      token: !env_var SUPERVISOR_TOKEN

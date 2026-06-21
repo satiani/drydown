@@ -1,0 +1,14 @@
+---
+# AppDaemon add-on UI config snippet.
+#
+# Paste these options into the AppDaemon add-on's Configuration panel in HA
+# (Settings → Add-ons → AppDaemon → Configuration). This installs the
+# `requests` package the app needs to query InfluxDB.
+#
+# Do NOT commit any real secrets here. InfluxDB credentials live in
+# drydown.yaml below (your InfluxDB add-on uses the default
+# homeassistant/homeassistant creds, which are not secret within the HA
+# network — adjust if you've changed them).
+
+python_packages:
+  - requests
