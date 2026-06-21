@@ -35,15 +35,6 @@ drydown:
   influx_retries: 3
   influx_backoff: 1.0
 
-  # MQTT broker. The app publishes retained discovery + state here. Requires
-  # the Mosquitto broker add-on and HA's MQTT integration (see README). Use
-  # the same credentials the MQTT integration uses, or a dedicated HA user.
-  mqtt:
-    host: core-mosquitto
-    port: 1883
-    username: homeassistant
-    password: REPLACE_WITH_MQTT_PASSWORD
-
   lookback_days: 60
 
   # Plant sensors to track. Key = plant label (becomes the device name and the

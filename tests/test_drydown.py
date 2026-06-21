@@ -40,7 +40,12 @@ def make_app(**overrides):
     app.influx_retries = 3
     app.influx_backoff = 0  # no sleeping in tests
     app.dry_run = False
-    app._mqtt_client = None
+    app._calls = []  # call_service captures here
+
+    def call_service(service, **kwargs):
+        app._calls.append((service, kwargs))
+
+    app.call_service = call_service
     for k, v in overrides.items():
         setattr(app, k, v)
     return app
@@ -524,25 +529,36 @@ def test_mqtt_payloads_renamed_entities_present():
 
 
 def test_publish_plant_dry_run_does_not_publish():
-    """In dry_run mode _publish_plant logs and never touches the MQTT client."""
+    """In dry_run mode _publish_plant logs and never calls mqtt/publish."""
     app = make_app()
     app.dry_run = True
-    published = []
-    app._mqtt_client = type("C", (), {"publish": staticmethod(
-        lambda *a, **k: published.append((a, k)))})()
     app._publish_plant("p1", _result())
-    assert published == []  # nothing published
+    assert app._calls == []  # nothing published
 
 
-def test_publish_plant_publishes_all_payloads():
+def test_publish_plant_publishes_all_payloads_via_service():
+    """Publishing goes through HA's mqtt/publish service, one call per message."""
     app = make_app()
-    published = []
-    app._mqtt_client = type("C", (), {"publish": staticmethod(
-        lambda topic, payload, qos=0, retain=False:
-            published.append((topic, payload, retain)))})()
     app._publish_plant("p1", _result())
-    assert len(published) == 22
-    assert all(r is True for _, _, r in published)
+    services = [s for s, _ in app._calls]
+    assert all(s == "mqtt/publish" for s in services)
+    assert len(app._calls) == 22  # 11 metrics x (1 discovery + 1 state)
+    # Spot-check: discovery config is retained + JSON; state is retained.
+    dryness_calls = [(kw["topic"], kw["payload"], kw["retain"])
+                     for _, kw in app._calls
+                     if kw["topic"].endswith("_dryness/config")
+                     or kw["topic"] == "drydown/p1/dryness/state"]
+    topics = {t for t, _, _ in dryness_calls}
+    assert "homeassistant/sensor/drydown/p1_dryness/config" in topics
+    assert "drydown/p1/dryness/state" in topics
+    assert all(r is True for _, _, r in dryness_calls)
+    # State payload is the numeric string; config payload parses as JSON.
+    state_payload = next(p for t, p, _ in dryness_calls
+                         if t == "drydown/p1/dryness/state")
+    assert state_payload == "67"
+    config_payload = next(p for t, p, _ in dryness_calls
+                          if t.endswith("_dryness/config"))
+    assert json.loads(config_payload)["name"] == "Dryness"
 
 
 # ---- initialize scheduling -------------------------------------------------
@@ -564,7 +580,7 @@ def test_initialize_builds_hourly_start_time():
         "sensors": {},
         "jump_threshold": {"small": 15, "medium": 8, "large": 5},
         "schedule": {"hourly_update": {"type": "hourly", "minute": 5}},
-        "dry_run": True,  # skip _mqtt_connect (no broker / paho in tests)
+        "dry_run": True,  # avoid the startup _run_all publishing path
     }
     app.initialize()
     assert captured["start"] == dt.time(hour=0, minute=5)

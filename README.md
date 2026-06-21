@@ -2,7 +2,7 @@
 
 A [Home Assistant](https://www.home-assistant.io/) / [AppDaemon](https://appdaemon.readthedocs.io/) app that turns raw plant-moisture sensor readings into a normalized, per-plant **dryness** indicator — calibrated from each plant's own watering history so the same % means the same thing across sensors with different soils, probe placements, and pot sizes.
 
-The app is a pure **InfluxDB → MQTT** transformer: it reads moisture/conductivity history from InfluxDB, learns a per-plant wet ceiling and dry floor from detected watering events, and publishes one Home Assistant **device** per plant over MQTT (via [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#discovery)) with one sensor entity per metric. Each entity gets its own history. The app reads nothing from HA's state machine and writes entities only via MQTT, so HA's MQTT integration owns the entity/device registries.
+The app is a pure **InfluxDB → MQTT** transformer: it reads moisture/conductivity history from InfluxDB, learns a per-plant wet ceiling and dry floor from detected watering events, and publishes one Home Assistant **device** per plant over MQTT (via [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#discovery)) with one sensor entity per metric. It reads nothing from HA's state machine and publishes via HA's `mqtt.publish` service — so it holds no broker credentials. Each entity gets its own history; HA's MQTT integration owns the entity/device registries.
 
 ## What you get per plant
 
@@ -35,19 +35,19 @@ The dry floor is **purely learned** from detected watering events — no heurist
 ## Requirements
 
 1. **InfluxDB** with your moisture/conductivity history (the HA InfluxDB integration). The app queries measurements named by unit (`"%"`, `/.*S.cm/`) — configurable.
-2. **AppDaemon** add-on. `paho-mqtt` (used for publishing) is already bundled with it — no extra package needed.
-3. **Mosquitto broker** add-on + HA's **MQTT integration**. The app publishes discovery + state to the broker; HA's MQTT integration creates the devices/entities from that. The Mosquitto add-on does **not** support anonymous logins — create a dedicated HA user (Settings → People → Users, Advanced Mode) and use those credentials for both the MQTT integration and the app.
+2. **AppDaemon** add-on.
+3. **Mosquitto broker** add-on + HA's **MQTT integration**. The app publishes discovery + state by calling HA's `mqtt.publish` service, so it needs no broker credentials of its own — HA's MQTT integration (already authenticated to the broker) relays the messages.
 
 ## Install
 
 1. Copy `apps/drydown/` into your AppDaemon add-on's apps dir (`/addon_configs/a0d7b954_appdaemon/apps/drydown/`).
-2. Edit `apps/drydown/drydown.yaml`: set the MQTT password (and adjust InfluxDB/sensors/pot sizes to match your setup).
+2. Edit `apps/drydown/drydown.yaml` to point at your InfluxDB and list your sensors (with `pot_size`).
 3. Ensure the Mosquitto broker add-on is running and HA's MQTT integration is configured (see Requirements).
 4. Restart the AppDaemon add-on. Devices appear on the first run (~30s after startup).
 
 ## Configure
 
-Everything is in [`apps/drydown/drydown.yaml`](apps/drydown/drydown.yaml): InfluxDB connection + retry, MQTT broker + credentials, sensors (with `pot_size`), lookback window, and the watering-detection / confidence tunables (all commented).
+Everything is in [`apps/drydown/drydown.yaml`](apps/drydown/drydown.yaml): InfluxDB connection + retry, sensors (with `pot_size`), lookback window, and the watering-detection / confidence tunables (all commented). No broker credentials are needed — the app publishes through HA's `mqtt.publish` service.
 
 Set `dry_run: true` to compute and log results per plant without publishing — useful for validating calibration against live data with no side effects.
 

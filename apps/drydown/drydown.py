@@ -7,9 +7,10 @@ per plant (via MQTT discovery) with one sensor entity per metric. Each entity
 gets its own history. See README.md for the full method.
 
 The app is a pure InfluxDB → MQTT transformer: it reads nothing from HA's
-state machine and writes entities only via MQTT. HA's MQTT integration owns
-the entity/device registries; the app just publishes retained discovery +
-state.
+state machine and publishes entities via HA's `mqtt.publish` service (over the
+websocket AppDaemon already maintains), so it holds no broker credentials.
+HA's MQTT integration owns the entity/device registries; the app just asks HA
+to publish retained discovery + state on its behalf.
 """
 
 import datetime as dt
@@ -49,9 +50,6 @@ class Drydown(hass.Hass):
         # publish (so no entities are created or modified). Used to validate
         # calibration against live data without side effects.
         self.dry_run = self.args.get("dry_run", False)
-        self._mqtt_client = None
-        if not self.dry_run:
-            self._mqtt_connect()
 
         sched = self.args.get("schedule", {})
         hu = sched.get("hourly_update", {"type": "hourly", "minute": 5})
@@ -70,15 +68,6 @@ class Drydown(hass.Hass):
         self.log("drydown scheduled: hourly at :%02d", int(hu.get("minute", 0)))
         if self.dry_run:
             self.log("drydown DRY RUN enabled — nothing will be published")
-
-    def terminate(self):
-        if self._mqtt_client is not None:
-            try:
-                self._mqtt_client.loop_stop()
-                self._mqtt_client.disconnect()
-            except Exception:
-                pass
-        self.log("drydown terminated")
 
     # ---- Orchestration ------------------------------------------------------
 
@@ -529,34 +518,17 @@ class Drydown(hass.Hass):
                  result["dry_floor"], result["confidence"], result["eta_days"])
 
     def _mqtt_connect(self):
-        cfg = self.args.get("mqtt")
-        if not cfg:
-            self.log("drydown: no mqtt config; cannot publish", level="ERROR")
-            return
-        try:
-            import paho.mqtt.client as mqtt
-        except ImportError:
-            self.log("drydown: paho-mqtt not installed; cannot publish",
-                     level="ERROR")
-            return
-        try:
-            try:
-                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                                     client_id="drydown")
-            except (AttributeError, TypeError):
-                client = mqtt.Client(client_id="drydown")
-            if cfg.get("username"):
-                client.username_pw_set(cfg["username"], cfg.get("password", ""))
-            client.reconnect_delay_set(min_delay=1, max_delay=120)
-            client.connect(cfg["host"], int(cfg.get("port", 1883)), 60)
-            client.loop_start()
-            self._mqtt_client = client
-            self.log("drydown: MQTT connected to %s:%s",
-                     cfg["host"], cfg.get("port", 1883))
-        except Exception as e:
-            self.log("drydown: MQTT connect failed: %s", e, level="ERROR")
+        # Kept as a no-op stub for backward compatibility; publishing now goes
+        # through HA's mqtt.publish service (see _mqtt_publish), which needs no
+        # broker connection or credentials of its own.
+        return
 
     def _mqtt_publish(self, topic, payload, retain=False):
-        if self._mqtt_client is None:
-            return
-        self._mqtt_client.publish(topic, payload, qos=0, retain=retain)
+        """Publish via HA's mqtt.publish service over the websocket.
+
+        HA's MQTT integration is already authenticated to the broker, so the
+        app holds no broker credentials — it asks HA to publish on its behalf.
+        Discovery (retained) and state both go through this path.
+        """
+        self.call_service("mqtt/publish", topic=topic, payload=payload,
+                          retain=retain)
