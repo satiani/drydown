@@ -1,0 +1,21 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# pycodestyle errors/warnings, pyflakes, isort, flake8-bugbear. pyupgrade (UP)
+# is intentionally omitted: the app uses %-style logging (AppDaemon's lazy
+# formatting) and typing.Optional, both deliberate.
+select = ["E", "W", "F", "I", "B"]
+# E501 (line length) is enforced via line-length; keep long descriptive
+# comments/queries readable rather than fighting the formatter.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests import `conftest` first to install the AppDaemon stub before any app
+# module, which is intentionally before other imports (E402) and not isort's
+# preferred order (I001).
+"tests/*" = ["E402", "I001"]

@@ -1,64 +1,56 @@
 # drydown
 
-A [Home Assistant](https://www.home-assistant.io/) / [AppDaemon](https://appdaemon.readthedocs.io/) app that turns raw plant-moisture sensor readings into a normalized, per-plant **dryness** indicator — calibrated from each plant's own watering history so the same % means the same thing across sensors with different soils, probe placements, and pot sizes.
+A [Home Assistant](https://www.home-assistant.io/) / [AppDaemon](https://appdaemon.readthedocs.io/) app that turns raw plant-moisture readings into a normalized, per-plant **dryness %** — calibrated from each plant's own watering history, so the same % means the same thing across sensors with different soils, probes, and pot sizes.
 
-The app is a pure **InfluxDB → MQTT** transformer: it reads moisture/conductivity history from InfluxDB, learns a per-plant wet ceiling and dry floor from detected watering events, and publishes one Home Assistant **device** per plant over MQTT (via [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#discovery)) with one sensor entity per metric. It reads nothing from HA's state machine and publishes via HA's `mqtt.publish` service — so it holds no broker credentials. Each entity gets its own history; HA's MQTT integration owns the entity/device registries.
+It reads moisture/conductivity history from InfluxDB and publishes one HA **device** per plant via [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#discovery). It holds no broker credentials — it publishes through HA's `mqtt.publish` service.
 
 ## What you get per plant
 
-One device (e.g. "Plant 4") with these sensor entities, each with a sensible icon, unit, and full history:
+One device (e.g. "Plant 4 Drydown") with a sensor entity per metric, each with its own history:
 
 | entity | unit | what |
 |---|---|---|
 | Dryness | % | 0 = just watered, 100 = water now (the primary output) |
-| Moisture | % | current raw reading |
-| Conductivity | µS/cm | current raw reading |
-| Next Watering Estimate | d | days until water needed (unavailable when it can't be estimated) |
-| Wet Ceiling | % | learned field-capacity plateau |
-| Dry Floor | % | learned trigger floor |
-| Drydown rate (3d) | %/d | moisture dry-down rate |
+| Moisture / Conductivity | % / µS/cm | current raw readings |
+| Next Watering Estimate | d | days until water needed |
+| Wet Ceiling / Dry Floor | % | learned calibration bounds |
+| Drydown rate (3d) | %/d | current dry-down rate |
 | Status | — | ok / water soon / WATER NOW / UNCALIBRATED |
 | Confidence | — | uncalibrated / low / medium / high |
-| Waterings Detected | — | count of watering events learned from |
-| Valid Waterings | — | count that qualified as dry-trigger waterings |
+| Waterings / Valid Waterings | — | watering events learned from |
 
 ## How it works
 
-The dry floor is **purely learned** from detected watering events — no heuristic prior. A plant stays `UNCALIBRATED` until it has seen at least one *valid* watering (one where the plant had actually dried first).
-
-- **Wet ceiling** — median of post-watering plateaus across detected events.
-- **Dry floor** — the driest pre-watering moisture among *valid* waterings. A watering is valid only if pre-watering moisture was below 65% of the wet ceiling, filtering out mass-waterings of still-moist plants.
-- **Watering detection** — from the moisture reading alone: a watering is detected on a day where the max moisture jumps ≥ `jump_threshold` above the previous day's mean **or** the dry-down slope reverses. The threshold is adaptive by pot size (small 15, medium 8, large 5).
-- **Dryness** — `clamp((wet_ceiling − current) / (wet_ceiling − dry_floor) × 100, 0, 100)`.
-- **Next Watering Estimate** — `(current − dry_floor) / −slope_3d`.
+The app detects watering events from moisture jumps and learns each plant's **wet ceiling** (post-watering plateau) and **dry floor** (driest reading before a real watering). Dryness is then where the current reading sits between those two bounds. The floor is *learned only* — a plant stays `UNCALIBRATED` until it has seen at least one watering where it had genuinely dried out first.
 
 ## Requirements
 
-1. **InfluxDB** with your moisture/conductivity history (the HA InfluxDB integration). The app queries measurements named by unit (`"%"`, `/.*S.cm/`) — configurable.
+1. **InfluxDB** with your moisture/conductivity history (the HA InfluxDB integration).
 2. **AppDaemon** add-on.
-3. **Mosquitto broker** add-on + HA's **MQTT integration**. The app publishes discovery + state by calling HA's `mqtt.publish` service, so it needs no broker credentials of its own — HA's MQTT integration (already authenticated to the broker) relays the messages.
+3. **Mosquitto broker** add-on + HA's **MQTT integration** (the app relays through it, so it needs no broker credentials of its own).
 
 ## Install
 
-1. Copy `apps/drydown/` into your AppDaemon add-on's apps dir (`/addon_configs/a0d7b954_appdaemon/apps/drydown/`).
-2. Edit `apps/drydown/drydown.yaml` to point at your InfluxDB and list your sensors (with `pot_size`).
-3. Ensure the Mosquitto broker add-on is running and HA's MQTT integration is configured (see Requirements).
-4. Restart the AppDaemon add-on. Devices appear on the first run (~30s after startup).
+1. Copy `apps/drydown/` into your AppDaemon apps dir (e.g. `/addon_configs/a0d7b954_appdaemon/apps/drydown/`).
+2. Edit `apps/drydown/drydown.yaml` to point at your InfluxDB and list your sensors (each with a `pot_size`).
+3. Restart the AppDaemon add-on. Devices appear ~30s after startup.
+
+For updates, [`scripts/deploy.sh`](scripts/deploy.sh) lints, tests, copies the modules over SSH, restarts the add-on, and verifies a clean run. It never overwrites your live `drydown.yaml`; SSH/host settings are overridable via env vars (see the script header).
 
 ## Configure
 
-Everything is in [`apps/drydown/drydown.yaml`](apps/drydown/drydown.yaml): InfluxDB connection + retry, sensors (with `pot_size`), lookback window, and the watering-detection / confidence tunables (all commented). No broker credentials are needed — the app publishes through HA's `mqtt.publish` service.
+All options live in [`apps/drydown/drydown.yaml`](apps/drydown/drydown.yaml) (InfluxDB connection, sensors, and detection/confidence tunables) — each is commented. Set `dry_run: true` to compute and log results without publishing.
 
-Set `dry_run: true` to compute and log results per plant without publishing — useful for validating calibration against live data with no side effects.
+InfluxDB credentials live in plaintext in `drydown.yaml`. With the default add-on setup these are the non-secret in-network `homeassistant/homeassistant` credentials; if you set real ones, treat the file as a secret.
 
 ## Develop
 
 ```
-python -m venv .venv && .venv/bin/pip install pytest requests
-.venv/bin/python -m pytest
+python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest && .venv/bin/ruff check .
 ```
 
-Tests cover the calibration math, watering detection, InfluxDB layer, and MQTT payload construction. AppDaemon and InfluxDB are stubbed (`tests/conftest.py`).
+The code under `apps/drydown/` is split by responsibility: `calibration.py` (pure math), `influx.py` (InfluxDB reads), `publish.py` (MQTT payloads), and `drydown.py` (the AppDaemon shell). Tests mirror that layout; AppDaemon and InfluxDB are stubbed in `tests/conftest.py`.
 
 ## License
 

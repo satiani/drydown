@@ -13,11 +13,14 @@ import os
 import sys
 import types
 
-# Make the repo root importable so `from apps.drydown import drydown` works
-# without the app needing to be an installed package.
+# Put the app directory on sys.path exactly as AppDaemon does at runtime, so
+# the app's sibling modules import as top-level (`import calibration`, etc.).
+# The repo root is also added so `apps.drydown` remains importable if needed.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_APP_DIR = os.path.join(_REPO_ROOT, "apps", "drydown")
+for _p in (_REPO_ROOT, _APP_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 def _install_appdaemon_stub() -> None:

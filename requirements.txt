@@ -1,0 +1,4 @@
+# Runtime dependencies for the drydown AppDaemon app.
+# AppDaemon itself is provided by the add-on; install this into the add-on's
+# python_packages (see appdaemon_config.yaml).
+requests>=2.28

@@ -38,46 +38,34 @@ drydown:
   lookback_days: 60
 
   # Plant sensors to track. Key = plant label (becomes the device name and the
-  # entity-id prefix). pot_size selects the adaptive watering-detection jump
-  # threshold (small 15, medium 8, large 5). Conductivity entity is derived by
-  # replacing `_moisture` with `_conductivity`.
+  # entity-id prefix). Conductivity entity is derived by replacing `_moisture`
+  # with `_conductivity`.
   sensors:
     plant_1:
       moisture_entity: sensor.plant_sensor_1_moisture
-      pot_size: medium
     plant_2:
       moisture_entity: sensor.plant_sensor_2_moisture
-      pot_size: small
     plant_3:
       moisture_entity: sensor.plant_sensor_3_moisture
-      pot_size: medium
     plant_4:
       moisture_entity: sensor.plant_sensor_4_moisture
-      pot_size: large
     plant_5:
       moisture_entity: sensor.plant_sensor_5_moisture
-      pot_size: large
     plant_6:
       moisture_entity: sensor.plant_sensor_6_moisture
-      pot_size: medium
     plant_7:
       moisture_entity: sensor.living_room_plant_sensor_7_moisture
-      pot_size: medium
     plant_8:
       moisture_entity: sensor.kitchen_plant_sensor_8_moisture
-      pot_size: medium
     plant_9:
       moisture_entity: sensor.kitchen_plant_sensor_9_moisture
-      pot_size: medium
 
-  jump_threshold:
-    small: 15
-    medium: 8
-    large: 5
+  # A watering is detected when a day's peak moisture jumps this many points
+  # above the previous day's peak. Real waterings spike by tens of %; sensor
+  # noise is a few %, so one threshold separates them across all pots.
+  jump_threshold: 10
 
   valid_watering_floor_fraction: 0.65
-  slope_reversal_margin: 1.0
-  confidence_valid_for_medium: 1
   confidence_valid_for_high: 3
 
   schedule:
