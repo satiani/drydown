@@ -1,13 +1,19 @@
-"""drydown — normalized plant water-need indicator for Home Assistant.
+"""drydown — normalized plant dryness indicator for Home Assistant.
 
-Pass A: purely-learned floor model (no heuristic prior). See README.md for
-the full method description. This app reads moisture/conductivity history
-from InfluxDB, detects watering events from moisture jumps, learns a
-per-plant wet ceiling and dry floor, computes a 0–100 water-need %, and
-writes one sensor entity per plant.
+Reads moisture/conductivity history + latest readings from InfluxDB, detects
+watering events from moisture jumps, learns a per-plant wet ceiling and dry
+floor, computes a 0–100 dryness %, and publishes one Home Assistant **device**
+per plant (via MQTT discovery) with one sensor entity per metric. Each entity
+gets its own history. See README.md for the full method.
+
+The app is a pure InfluxDB → MQTT transformer: it reads nothing from HA's
+state machine and writes entities only via MQTT. HA's MQTT integration owns
+the entity/device registries; the app just publishes retained discovery +
+state.
 """
 
 import datetime as dt
+import json
 import statistics
 import time
 
@@ -16,12 +22,11 @@ import requests
 
 
 class Drydown(hass.Hass):
-    """AppDaemon app that writes sensor.drydown_<plant> entities."""
+    """AppDaemon app that publishes drydown plant devices over MQTT."""
 
     # ---- AppDaemon lifecycle ------------------------------------------------
 
     def initialize(self):
-        # yaml config is exposed by AppDaemon as self.args
         self.log("drydown starting")
         self._influx = self.args["influxdb"]
         self.sensors = self.args["sensors"]
@@ -41,9 +46,12 @@ class Drydown(hass.Hass):
         self.influx_retries = self.args.get("influx_retries", 3)
         self.influx_backoff = self.args.get("influx_backoff", 1.0)
         # Read-only mode: compute everything and log results as JSON, but never
-        # call set_state (so no entities are created or modified). Used to
-        # validate calibration against live data before enabling for real.
+        # publish (so no entities are created or modified). Used to validate
+        # calibration against live data without side effects.
         self.dry_run = self.args.get("dry_run", False)
+        self._mqtt_client = None
+        if not self.dry_run:
+            self._mqtt_connect()
 
         sched = self.args.get("schedule", {})
         hu = sched.get("hourly_update", {"type": "hourly", "minute": 5})
@@ -61,39 +69,64 @@ class Drydown(hass.Hass):
 
         self.log("drydown scheduled: hourly at :%02d", int(hu.get("minute", 0)))
         if self.dry_run:
-            self.log("drydown DRY RUN enabled — no entities will be written")
+            self.log("drydown DRY RUN enabled — nothing will be published")
+
+    def terminate(self):
+        if self._mqtt_client is not None:
+            try:
+                self._mqtt_client.loop_stop()
+                self._mqtt_client.disconnect()
+            except Exception:
+                pass
+        self.log("drydown terminated")
 
     # ---- Orchestration ------------------------------------------------------
 
     def _run_all(self, kwargs):
-        """Pull history once, compute per-plant, write entities."""
+        """Pull history + latest from InfluxDB, compute per-plant, publish."""
         try:
             self.log("drydown run starting")
             history = self._pull_history()
             if not history:
                 self.log("drydown: no history pulled, skipping", level="WARNING")
                 return
+            latest = self._pull_latest()
             for plant_key, src in self.sensors.items():
                 try:
-                    result = self._compute_plant(plant_key, src, history)
+                    result = self._compute_plant(plant_key, src, history, latest)
                 except Exception as e:
                     self.log("drydown: error computing %s: %s", plant_key, e, level="ERROR")
                     continue
-                self._write_entity(plant_key, result)
+                self._publish_plant(plant_key, result)
             self.log("drydown run complete")
         except Exception as e:
             self.log("drydown run failed: %s", e, level="ERROR")
 
     # ---- InfluxDB pull ------------------------------------------------------
 
+    def _entity_filter(self, ids):
+        """Build an OR clause of entity_id filters matching bare OR full id.
+
+        HA's InfluxDB integration stores `domain` and `entity_id` as separate
+        tags, so the entity_id tag is the bare id (e.g. 'plant_1_moisture',
+        not 'sensor.plant_1_moisture'). Match either form to be robust.
+        """
+        clauses = []
+        for e in ids:
+            b = self._bare_eid(e)
+            if b == e:
+                clauses.append(f'"entity_id" = \'{e}\'')
+            else:
+                clauses.append(f'("entity_id" = \'{b}\' OR "entity_id" = \'{e}\')')
+        return " OR ".join(clauses)
+
     def _pull_history(self):
         """Return {entity_id: [{'t':'YYYY-MM-DD','mn','mx','mean','cnt'}, ...]}.
 
-        Pulls daily aggregates for moisture and conductivity for all configured
-        sensors over the lookback window, in two batched queries. All time math
-        is UTC: the cutoff is UTC midnight and InfluxDB's time(1d) buckets are
-        UTC by default, so day boundaries are deterministic regardless of
-        AppDaemon's configured timezone.
+        Daily aggregates for moisture and conductivity over the lookback
+        window, in two batched queries. All time math is UTC: the cutoff is
+        UTC midnight and InfluxDB's time(1d) buckets are UTC by default, so
+        day boundaries are deterministic regardless of AppDaemon's tz.
         """
         now = dt.datetime.now(dt.timezone.utc)
         since = (now - dt.timedelta(days=self.lookback_days)).strftime("%Y-%m-%d")
@@ -106,23 +139,12 @@ class Drydown(hass.Hass):
                                  (cond_ids, self.conductivity_measurement)]:
             if not ids:
                 continue
-            # HA's InfluxDB integration stores `domain` and `entity_id` as
-            # separate tags, so the entity_id tag is the BARE id (e.g.
-            # 'plant_1_moisture', not 'sensor.plant_1_moisture'). Match either
-            # form to be robust to schemas that store the full id.
-            bare_to_full = {self._bare_eid(e): e for e in ids}
-            clauses = []
-            for e in ids:
-                b = self._bare_eid(e)
-                if b == e:
-                    clauses.append(f'"entity_id" = \'{e}\'')
-                else:
-                    clauses.append(f'("entity_id" = \'{b}\' OR "entity_id" = \'{e}\')')
-            ors = " OR ".join(clauses)
+            ors = self._entity_filter(ids)
             q = (f'SELECT min("value"), max("value"), mean("value"), count("value") '
                  f'FROM {measurement} WHERE ({ors}) AND time >= \'{since}\' '
                  f'GROUP BY time(1d), "entity_id" fill(null)')
             data = self._influx_query(q)
+            bare_to_full = {self._bare_eid(e): e for e in ids}
             for series in data.get("series", []):
                 # Re-key by the full config entity_id so the rest of the app
                 # (which holds full ids) can look history up directly.
@@ -143,9 +165,39 @@ class Drydown(hass.Hass):
                     })
                 out.setdefault(eid, []).extend(rows)
 
-        # Sort each by date.
         for eid in out:
             out[eid].sort(key=lambda r: r["t"])
+        return out
+
+    def _pull_latest(self):
+        """Return {full_entity_id: latest_value} for moisture + conductivity.
+
+        Batched last() queries. This replaces reading HA's live state via the
+        websocket, so the app is a pure InfluxDB → MQTT transformer with a
+        single transport. The latest point may lag the live state by up to the
+        InfluxDB integration's write interval (~1 min) — irrelevant for an
+        hourly-recalibrated indicator.
+        """
+        out = {}
+        moisture_ids = [s["moisture_entity"] for s in self.sensors.values()]
+        cond_ids = [m.replace("_moisture", "_conductivity") for m in moisture_ids]
+
+        for ids, measurement in [(moisture_ids, self.moisture_measurement),
+                                 (cond_ids, self.conductivity_measurement)]:
+            if not ids:
+                continue
+            ors = self._entity_filter(ids)
+            q = (f'SELECT last("value") FROM {measurement} '
+                 f'WHERE ({ors}) GROUP BY "entity_id"')
+            data = self._influx_query(q)
+            bare_to_full = {self._bare_eid(e): e for e in ids}
+            for series in data.get("series", []):
+                eid_tag = series.get("tags", {}).get("entity_id")
+                eid = bare_to_full.get(eid_tag, eid_tag)
+                vals = series.get("values", [])
+                # columns: ["time", "last"]; one row per entity.
+                if vals and vals[0] and len(vals[0]) > 1 and vals[0][1] is not None:
+                    out[eid] = vals[0][1]
         return out
 
     def _influx_query(self, q):
@@ -199,8 +251,6 @@ class Drydown(hass.Hass):
                  self.influx_retries, last_exc, level="ERROR")
         return None
 
-    # ---- Latest reading (current state) ------------------------------------
-
     @staticmethod
     def _bare_eid(entity_id):
         """Return entity_id without its HA domain prefix.
@@ -211,26 +261,18 @@ class Drydown(hass.Hass):
         """
         return entity_id.split(".", 1)[1] if "." in entity_id else entity_id
 
-    def _latest(self, entity_id):
-        """Return the current numeric state of an entity, or None."""
-        try:
-            val = self.get_state(entity_id)
-            return float(val) if val is not None else None
-        except (TypeError, ValueError):
-            return None
-
     # ---- Per-plant computation ---------------------------------------------
 
-    def _compute_plant(self, plant_key, src, history):
+    def _compute_plant(self, plant_key, src, history, latest):
         moist_entity = src["moisture_entity"]
         cond_entity = moist_entity.replace("_moisture", "_conductivity")
 
         mrows = history.get(moist_entity, [])
         crows = history.get(cond_entity, [])
-        cur_mo = self._latest(moist_entity)
-        cur_co = self._latest(cond_entity)
+        cur_mo = latest.get(moist_entity)
+        cur_co = latest.get(cond_entity)
 
-        pot_size = self.get_state(moist_entity, attribute="pot_size") or "medium"
+        pot_size = src.get("pot_size", "medium")
         jump_thresh = self.jump_threshold.get(pot_size, self.jump_threshold["medium"])
 
         result = {
@@ -241,7 +283,7 @@ class Drydown(hass.Hass):
             "conductivity": cur_co,
             "wet_ceiling": None,
             "dry_floor": None,
-            "need_pct": None,
+            "dryness": None,
             "eta_days": None,
             "confidence": "uncalibrated",
             "status": "UNCALIBRATED",
@@ -253,8 +295,6 @@ class Drydown(hass.Hass):
         # Not enough history to calibrate at all.
         valid_means = [r["mean"] for r in mrows if r["mean"] is not None]
         if len(mrows) < 5 or len(valid_means) < 3:
-            result["status"] = "UNCALIBRATED"
-            result["confidence"] = "uncalibrated"
             return result
 
         # ---- Detect watering events ----
@@ -264,8 +304,6 @@ class Drydown(hass.Hass):
         # No watering observed yet -> cannot calibrate. Stay uncalibrated
         # rather than fabricating a floor from percentiles of raw readings.
         if not events:
-            result["status"] = "UNCALIBRATED"
-            result["confidence"] = "uncalibrated"
             return result
 
         # ---- Wet ceiling: median of post-watering plateaus ----
@@ -274,8 +312,6 @@ class Drydown(hass.Hass):
         result["wet_ceiling"] = round(wet, 1) if wet is not None else None
 
         if wet is None:
-            result["status"] = "UNCALIBRATED"
-            result["confidence"] = "uncalibrated"
             return result
 
         # ---- Learned dry floor: driest pre-watering min among *valid* events ----
@@ -290,8 +326,6 @@ class Drydown(hass.Hass):
         # Stay uncalibrated rather than guessing (the `low` tier is reserved
         # for a future weaker-floor estimate; see README).
         if not valid:
-            result["status"] = "UNCALIBRATED"
-            result["confidence"] = "uncalibrated"
             return result
         learned_floor = min(e["pre_min"] for e in valid)
 
@@ -308,22 +342,12 @@ class Drydown(hass.Hass):
         dry_floor = learned_floor
         result["dry_floor"] = round(dry_floor, 1)
 
-        # ---- Water need % ----
+        # ---- Dryness % (0 = just watered, 100 = water now) ----
         if cur_mo is not None and wet > dry_floor:
-            need_raw = (wet - cur_mo) / (wet - dry_floor) * 100
-            need = max(0, min(100, round(need_raw)))
+            need = max(0, min(100, round((wet - cur_mo) / (wet - dry_floor) * 100)))
         else:
-            need_raw = None
             need = None
-        result["need_pct"] = need
-        if self.dry_run:
-            # Full-precision debug values for verifying the math against the
-            # rounded display values. Only in dry-run; never written to HA.
-            result["_debug"] = {
-                "wet_raw": wet, "dry_floor_raw": dry_floor,
-                "cur_mo": cur_mo, "need_raw": need_raw,
-                "plateaus": plateaus, "valid_pre_mins": [e["pre_min"] for e in valid],
-            }
+        result["dryness"] = need
 
         # ---- Slope (7-day) and ETA ----
         slope = self._slope(mrows, n=7)
@@ -362,8 +386,8 @@ class Drydown(hass.Hass):
                 continue
             # Jump: today's max well above yesterday's mean.
             jump = cur["mx"] >= prev["mean"] + jump_thresh
-            # Rate reversal: 3-day slope ending today is >= 0 (flattened/rose)
-            # while it had been negative before.
+            # Rate reversal: slope over days i-1..i exceeds the prior slope
+            # by slope_reversal_margin (flattening/rising after draining).
             reversed_ = False
             if i >= 2:
                 pre_slope = self._seg_slope(mrows, i - 2, i)      # days i-2..i-1
@@ -414,41 +438,125 @@ class Drydown(hass.Hass):
         den = sum((x - mx) ** 2 for x in xs)
         return num / den if den else None
 
-    # ---- Entity write -------------------------------------------------------
+    # ---- MQTT publish -------------------------------------------------------
 
-    def _write_entity(self, plant_key, result):
-        if self.dry_run:
-            # Read-only: log the full result as a single JSON line and skip
-            # set_state entirely. No entity is created or modified.
-            import json
-            self.log("DRYRUN_RESULT %s", json.dumps(result, default=str, sort_keys=True))
-            return
-        entity_id = "sensor.drydown_%s" % plant_key
-        state = result["need_pct"] if result["need_pct"] is not None else "unavailable"
-        # If truly uncalibrated, surface that as the state for clarity.
-        if result["status"] == "UNCALIBRATED" and result["need_pct"] is None:
-            state = "uncalibrated"
-        attributes = {
-            "friendly_name": "Drydown %s" % plant_key.replace("_", " ").title(),
-            "unit_of_measurement": "%",
-            "device_class": "moisture",
-            "state_class": "measurement",
-            "plant": plant_key,
-            "moisture_entity": result["moisture_entity"],
-            "pot_size": result["pot_size"],
-            "moisture": result["moisture"],
-            "conductivity": result["conductivity"],
-            "wet_ceiling": result["wet_ceiling"],
-            "dry_floor": result["dry_floor"],
-            "slope_7d": result["slope_7d"],
-            "eta_days": result["eta_days"],
-            "confidence": result["confidence"],
-            "status": result["status"],
-            "waterings_detected": result["waterings_detected"],
-            "valid_waterings": result["valid_waterings"],
-            "last_updated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    @staticmethod
+    def _metric_specs():
+        """Per-entity MQTT discovery spec. Entities with `stat_cla` are
+        numeric (state must be a number or empty → unavailable); entities
+        without it are free-form strings (status, confidence)."""
+        return [
+            {"obj": "dryness", "name": "Dryness", "key": "dryness",
+             "dev_cla": "moisture", "unit": "%", "stat_cla": "measurement"},
+            {"obj": "moisture", "name": "Moisture", "key": "moisture",
+             "dev_cla": "moisture", "unit": "%", "stat_cla": "measurement"},
+            {"obj": "conductivity", "name": "Conductivity", "key": "conductivity",
+             "dev_cla": "conductivity", "unit": "µS/cm", "stat_cla": "measurement"},
+            {"obj": "next_watering_estimate", "name": "Next Watering Estimate",
+             "key": "eta_days", "dev_cla": "duration", "unit": "d",
+             "stat_cla": "measurement"},
+            {"obj": "wet_ceiling", "name": "Wet Ceiling", "key": "wet_ceiling",
+             "dev_cla": "moisture", "unit": "%", "icon": "mdi:water",
+             "stat_cla": "measurement"},
+            {"obj": "dry_floor", "name": "Dry Floor", "key": "dry_floor",
+             "dev_cla": "moisture", "unit": "%", "icon": "mdi:water-outline",
+             "stat_cla": "measurement"},
+            {"obj": "drydown_rate_7d", "name": "Drydown rate (7d)", "key": "slope_7d",
+             "unit": "%/d", "icon": "mdi:trending-down", "stat_cla": "measurement"},
+            {"obj": "status", "name": "Status", "key": "status", "icon": "mdi:leaf"},
+            {"obj": "confidence", "name": "Confidence", "key": "confidence",
+             "icon": "mdi:shield-check"},
+            {"obj": "waterings_detected", "name": "Waterings Detected",
+             "key": "waterings_detected", "icon": "mdi:watering-can",
+             "stat_cla": "measurement"},
+            {"obj": "valid_waterings", "name": "Valid Waterings",
+             "key": "valid_waterings", "icon": "mdi:water-check",
+             "stat_cla": "measurement"},
+        ]
+
+    def _plant_mqtt_payloads(self, plant_key, result):
+        """Build the (topic, payload, retain) messages for one plant: one
+        retained discovery config + one retained state per metric. Pure — no
+        I/O — so it's unit-testable without a broker.
+
+        Discovery is published every run; it's idempotent (HA ignores
+        re-publication) and survives broker restarts where retention was lost.
+        """
+        dev = {
+            "identifiers": ["drydown_%s" % plant_key],
+            "name": plant_key.replace("_", " ").title(),
+            "manufacturer": "drydown",
+            "model": "Plant",
         }
-        self.set_state(entity_id, state=state, attributes=attributes)
-        self.log("drydown %s: state=%s need=%s wet=%s dry=%s conf=%s eta=%s",
-                 plant_key, state, result["need_pct"], result["wet_ceiling"],
+        msgs = []
+        for spec in self._metric_specs():
+            obj = spec["obj"]
+            disc_topic = "homeassistant/sensor/drydown/%s_%s/config" % (plant_key, obj)
+            state_topic = "drydown/%s/%s/state" % (plant_key, obj)
+            config = {
+                "name": spec["name"],
+                "uniq_id": "drydown_%s_%s" % (plant_key, obj),
+                "stat_t": state_topic,
+                "dev": dev,
+            }
+            for ck, cv in (("dev_cla", "dev_cla"), ("unit", "unit_of_meas"),
+                           ("stat_cla", "stat_cla"), ("icon", "icon")):
+                if ck in spec:
+                    config[cv] = spec[ck]
+            msgs.append((disc_topic, json.dumps(config), True))
+
+            value = result.get(spec["key"])
+            numeric = "stat_cla" in spec
+            if numeric:
+                # A unit-bearing entity must publish a number; non-numeric
+                # (e.g. ETA "rising"/"unknown") or None -> empty (unavailable).
+                ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+                payload = str(value) if ok else ""
+            else:
+                payload = "" if value is None else str(value)
+            msgs.append((state_topic, payload, True))
+        return msgs
+
+    def _publish_plant(self, plant_key, result):
+        if self.dry_run:
+            self.log("DRYRUN_RESULT %s",
+                     json.dumps(result, default=str, sort_keys=True))
+            return
+        for topic, payload, retain in self._plant_mqtt_payloads(plant_key, result):
+            self._mqtt_publish(topic, payload, retain=retain)
+        self.log("drydown %s: dryness=%s wet=%s dry=%s conf=%s eta=%s",
+                 plant_key, result["dryness"], result["wet_ceiling"],
                  result["dry_floor"], result["confidence"], result["eta_days"])
+
+    def _mqtt_connect(self):
+        cfg = self.args.get("mqtt")
+        if not cfg:
+            self.log("drydown: no mqtt config; cannot publish", level="ERROR")
+            return
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            self.log("drydown: paho-mqtt not installed; cannot publish",
+                     level="ERROR")
+            return
+        try:
+            try:
+                client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                     client_id="drydown")
+            except (AttributeError, TypeError):
+                client = mqtt.Client(client_id="drydown")
+            if cfg.get("username"):
+                client.username_pw_set(cfg["username"], cfg.get("password", ""))
+            client.reconnect_delay_set(min_delay=1, max_delay=120)
+            client.connect(cfg["host"], int(cfg.get("port", 1883)), 60)
+            client.loop_start()
+            self._mqtt_client = client
+            self.log("drydown: MQTT connected to %s:%s",
+                     cfg["host"], cfg.get("port", 1883))
+        except Exception as e:
+            self.log("drydown: MQTT connect failed: %s", e, level="ERROR")
+
+    def _mqtt_publish(self, topic, payload, retain=False):
+        if self._mqtt_client is None:
+            return
+        self._mqtt_client.publish(topic, payload, qos=0, retain=retain)

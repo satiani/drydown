@@ -1,15 +1,16 @@
-"""Tests for drydown's calibration math and watering detection.
+"""Tests for drydown's calibration math, watering detection, and MQTT output.
 
-These cover the pure-Python domain logic — the parts that actually compute
-the product (water-need %, ETA, confidence tiers, watering detection). The
-AppDaemon/InfluxDB I/O layer is stubbed; we feed daily aggregates directly
-and assert on the computed result dicts.
+These cover the pure-Python domain logic — the parts that compute the product
+(dryness %, ETA, confidence tiers, watering detection) plus the MQTT payload
+construction. The AppDaemon/InfluxDB/MQTT I/O layers are stubbed; we feed
+daily aggregates + latest values directly and assert on result dicts and
+the (topic, payload, retain) message lists.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import types
+import json
 
 import pytest
 
@@ -39,17 +40,7 @@ def make_app(**overrides):
     app.influx_retries = 3
     app.influx_backoff = 0  # no sleeping in tests
     app.dry_run = False
-    app._current_state = {}        # entity_id -> state value
-    app._current_attrs = {}        # entity_id -> attr dict
-    app._set_states = {}
-
-    # Wire get_state to the per-test override maps.
-    def get_state(entity_id, attribute=None, default=None, **kwargs):
-        if attribute is not None:
-            return app._current_attrs.get(entity_id, {}).get(attribute, default)
-        return app._current_state.get(entity_id, default)
-
-    app.get_state = get_state
+    app._mqtt_client = None
     for k, v in overrides.items():
         setattr(app, k, v)
     return app
@@ -65,8 +56,18 @@ def dates(start="2024-01-01", n=10):
     return [(d + dt.timedelta(days=i)).isoformat() for i in range(n)]
 
 
-# ---- _linear_slope ---------------------------------------------------------
+def _setup_plant(app, moist_entity, mrows, cur_mo, pot_size="medium"):
+    """Wire a plant's history + latest values into the app for _compute_plant.
 
+    Returns (src, history, latest) ready to pass to _compute_plant."""
+    cond = moist_entity.replace("_moisture", "_conductivity")
+    src = {"moisture_entity": moist_entity, "pot_size": pot_size}
+    history = {moist_entity: mrows, cond: []}
+    latest = {moist_entity: cur_mo, cond: 100}
+    return src, history, latest
+
+
+# ---- _bare_eid / _entity_filter -------------------------------------------
 
 def test_bare_eid_strips_domain():
     assert dd.Drydown._bare_eid("sensor.plant_1_moisture") == "plant_1_moisture"
@@ -74,6 +75,19 @@ def test_bare_eid_strips_domain():
     # Only the first dot splits domain from object id.
     assert dd.Drydown._bare_eid("sensor.a.b_moisture") == "a.b_moisture"
 
+
+def test_entity_filter_matches_bare_or_full():
+    app = make_app()
+    ids = ["sensor.plant_1_moisture", "plant_2_moisture"]
+    f = app._entity_filter(ids)
+    # Bare id form gets an OR; already-bare id gets a single equality.
+    assert '"entity_id" = \'plant_1_moisture\'' in f
+    assert '"entity_id" = \'sensor.plant_1_moisture\'' in f
+    assert '"entity_id" = \'plant_2_moisture\'' in f
+    assert " OR " in f
+
+
+# ---- _pull_history / _pull_latest (bare-tag keying) -----------------------
 
 def test_pull_history_keys_by_full_id_for_bare_tags():
     """HA's InfluxDB stores entity_id WITHOUT the domain prefix (domain is a
@@ -84,8 +98,6 @@ def test_pull_history_keys_by_full_id_for_bare_tags():
     app.sensors = {
         "plant_1": {"moisture_entity": "sensor.plant_1_moisture"},
     }
-    app.moisture_measurement = '"%"'
-    app.conductivity_measurement = "/.*S.cm/"
 
     # Canned InfluxDB response keyed off the measurement in the query:
     # HA's schema stores the entity_id tag WITHOUT the domain prefix.
@@ -105,12 +117,40 @@ def test_pull_history_keys_by_full_id_for_bare_tags():
 
     app._influx_query = fake_query
     history = app._pull_history()
-    # Keyed by the full config id, not the bare tag.
     assert "sensor.plant_1_moisture" in history
     assert "plant_1_moisture" not in history
     assert len(history["sensor.plant_1_moisture"]) == 2
     assert history["sensor.plant_1_moisture"][0]["t"] == "2024-01-01"
 
+
+def test_pull_latest_keys_by_full_id_and_takes_last():
+    """_pull_latest replaces the websocket get_state path: batched last()
+    queries, re-keyed by the full config id."""
+    app = make_app()
+    app.sensors = {
+        "plant_1": {"moisture_entity": "sensor.plant_1_moisture"},
+    }
+
+    def fake_query(q):
+        assert "last" in q
+        if ".*S.cm" in q:
+            tag = "plant_1_conductivity"
+        else:
+            tag = "plant_1_moisture"
+        # last() GROUP BY entity_id -> columns ["time","last"], one row.
+        return {"series": [{
+            "tags": {"entity_id": tag},
+            "columns": ["time", "last"],
+            "values": [["2024-01-02T00:00:00Z", 28]],
+        }]}
+
+    app._influx_query = fake_query
+    latest = app._pull_latest()
+    assert latest == {"sensor.plant_1_moisture": 28,
+                      "sensor.plant_1_conductivity": 28}
+
+
+# ---- _linear_slope ---------------------------------------------------------
 
 def test_linear_slope_descending():
     # y = -2x + 10 -> slope -2
@@ -125,8 +165,6 @@ def test_linear_slope_flat():
 def test_linear_slope_degenerate():
     assert dd.Drydown._linear_slope([]) is None
     assert dd.Drydown._linear_slope([3]) is None
-    # Zero variance in x is impossible with distinct integer indices >=2 pts,
-    # but constant y still yields slope 0, not None.
     assert dd.Drydown._linear_slope([3, 3]) == pytest.approx(0.0)
 
 
@@ -143,9 +181,7 @@ def test_slope_requires_three_points():
 def test_seg_slope_slice_bounds():
     app = make_app()
     rows = [row(t, 0, 0, m) for t, m in zip(dates(n=4), [10, 8, 6, 4])]
-    # slice [0:2] -> indices 0,1 -> slope -2
     assert app._seg_slope(rows, 0, 2) == pytest.approx(-2.0)
-    # negative start clamped to 0
     assert app._seg_slope(rows, -5, 2) == pytest.approx(-2.0)
 
 
@@ -153,7 +189,6 @@ def test_seg_slope_slice_bounds():
 
 def test_detect_watering_jump():
     app = make_app()
-    # Flat dry-ish plateau, then a clear jump on day 4, then drain.
     means = [20, 19, 18, 17, 45, 43, 41, 39, 37]
     mins = [m - 1 for m in means]
     maxs = [m + 1 for m in means]
@@ -163,8 +198,8 @@ def test_detect_watering_jump():
     events = app._detect_waterings(mrows, [], jump_thresh=8)
     assert len(events) == 1
     ev = events[0]
-    assert ev["pre_min"] == mins[3]  # prev day's min
-    assert ev["plateau"] >= 41       # settled post-watering mean is high
+    assert ev["pre_min"] == mins[3]
+    assert ev["plateau"] >= 41
 
 
 def test_detect_no_watering_when_steady():
@@ -177,10 +212,8 @@ def test_detect_no_watering_when_steady():
 def test_detect_watering_near_end_has_no_bogus_plateau():
     """A watering detected in the last days of the window has no settled
     post-watering readings, so its plateau must be None (excluded from the
-    wet-ceiling median) rather than the watering-day spike max, which would
-    inflate wet_ceiling. Regression guard."""
+    wet-ceiling median) rather than the watering-day spike max."""
     app = make_app()
-    # Watering spike on the very last day -> no future rows to settle on.
     means = [20, 19, 18, 17, 45]
     mins = [m - 1 for m in means]
     maxs = [m + 1 for m in means]
@@ -194,25 +227,15 @@ def test_detect_watering_near_end_has_no_bogus_plateau():
 
 # ---- _compute_plant --------------------------------------------------------
 
-def _setup_plant(app, moist_entity, mrows, cur_mo, pot_size="medium"):
-    app._current_state[moist_entity] = cur_mo
-    app._current_attrs[moist_entity] = {"pot_size": pot_size}
-    cond = moist_entity.replace("_moisture", "_conductivity")
-    app._current_state[cond] = 100
-    app._history = {moist_entity: mrows, cond: []}
-
-
 def test_compute_plant_uncalibrated_with_no_events():
     app = make_app()
     mo = "sensor.p_moisture"
-    # Steady, no watering jumps.
     mrows = [row(t, 30, 31, 30) for t in dates(n=20)]
-    _setup_plant(app, mo, mrows, cur_mo=30)
-    src = {"moisture_entity": mo}
-    res = app._compute_plant("p", src, app._history)
+    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=30)
+    res = app._compute_plant("p", src, history, latest)
     assert res["confidence"] == "uncalibrated"
     assert res["status"] == "UNCALIBRATED"
-    assert res["need_pct"] is None
+    assert res["dryness"] is None
     assert res["waterings_detected"] == 0
 
 
@@ -221,56 +244,47 @@ def test_compute_plant_uncalibrated_when_events_but_none_valid():
     NOT 'low'. Regression guard for the documented tier."""
     app = make_app()
     mo = "sensor.p_moisture"
-    # Already-moist plant that gets watered again without drying first.
-    # Wet ceiling ~45; pre-watering min ~40 is NOT < 0.65*45=29.25 -> invalid.
     means = [42, 41, 40, 39, 47, 45, 44, 43, 42, 41]
     mins = [m - 1 for m in means]
     maxs = [m + 1 for m in means]
     maxs[4] = 50
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(means)), mins, maxs, means)]
-    _setup_plant(app, mo, mrows, cur_mo=41)
-    src = {"moisture_entity": mo}
-    res = app._compute_plant("p", src, app._history)
+    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=41)
+    res = app._compute_plant("p", src, history, latest)
     assert res["waterings_detected"] >= 1
     assert res["valid_waterings"] == 0
     assert res["confidence"] == "uncalibrated"   # NOT "low"
     assert res["status"] == "UNCALIBRATED"
-    assert res["need_pct"] is None
+    assert res["dryness"] is None
 
 
 def test_compute_plant_calibrated_high_confidence():
     app = make_app()
     mo = "sensor.p_moisture"
-    # Three dry-then-water cycles. Floor ~15, ceiling ~45.
-    # Pattern per cycle: drain down to ~15, jump to ~45, drain a bit.
     seq = (
-        [45, 40, 35, 30, 25, 20, 15, 45, 40, 35,  # cycle 1 (water at idx 7)
-         30, 25, 20, 15, 45, 40, 35, 30, 25, 20,  # cycle 2 (water at idx 14)
-         15, 45, 40, 35, 30, 25]                   # cycle 3 (water at idx 21)
+        [45, 40, 35, 30, 25, 20, 15, 45, 40, 35,
+         30, 25, 20, 15, 45, 40, 35, 30, 25, 20,
+         15, 45, 40, 35, 30, 25]
     )
     mins = [m - 2 for m in seq]
     maxs = [m + 2 for m in seq]
-    # Make watering days' max clearly jump above prev mean + threshold.
     for wi in (7, 14, 21):
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    _setup_plant(app, mo, mrows, cur_mo=20)
-    src = {"moisture_entity": mo}
-    res = app._compute_plant("p", src, app._history)
-
+    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=20)
+    res = app._compute_plant("p", src, history, latest)
     assert res["confidence"] == "high"
     assert res["valid_waterings"] >= 3
     assert res["wet_ceiling"] is not None
     assert res["dry_floor"] is not None
-    assert res["dry_floor"] <= 20  # floor is the driest pre-watering min
-    # need = (wet - cur)/(wet - floor)*100, cur=20 between floor and wet.
-    assert 0 < res["need_pct"] < 100
+    assert res["dry_floor"] <= 20
+    assert 0 < res["dryness"] < 100
     assert res["status"] in ("ok", "water soon", "WATER NOW")
 
 
-def test_compute_plant_water_need_clamps_at_floor():
+def test_compute_plant_dryness_clamps_at_floor():
     app = make_app()
     mo = "sensor.p_moisture"
     seq = [45, 40, 35, 30, 25, 20, 15, 45, 40, 35, 30, 25, 20, 15, 45, 40]
@@ -280,10 +294,9 @@ def test_compute_plant_water_need_clamps_at_floor():
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    _setup_plant(app, mo, mrows, cur_mo=10)  # below floor -> clamp to 100
-    src = {"moisture_entity": mo}
-    res = app._compute_plant("p", src, app._history)
-    assert res["need_pct"] == 100
+    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=10)  # below floor
+    res = app._compute_plant("p", src, history, latest)
+    assert res["dryness"] == 100
     assert res["status"] == "WATER NOW"
 
 
@@ -297,22 +310,19 @@ def test_compute_plant_just_watered_is_zero():
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    _setup_plant(app, mo, mrows, cur_mo=45)  # at ceiling -> 0
-    src = {"moisture_entity": mo}
-    res = app._compute_plant("p", src, app._history)
-    assert res["need_pct"] == 0
+    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=45)  # at ceiling
+    res = app._compute_plant("p", src, history, latest)
+    assert res["dryness"] == 0
     assert res["status"] == "ok"
 
 
 def test_compute_plant_eta_from_slope():
     app = make_app()
     mo = "sensor.p_moisture"
-    # Two dry-then-water cycles, then a clean 7-day linear drain of -2/day
-    # at the tail so slope_7d is unambiguous.
     seq = (
-        [45, 43, 41, 39, 37, 35, 33,               # drain (watering later)
-         15, 45, 43, 41, 39, 37, 35, 33, 31, 29,   # water at idx 8, then drain
-         15, 45, 43, 41, 39, 37, 35, 33, 31]       # water at idx 19, clean tail
+        [45, 43, 41, 39, 37, 35, 33,
+         15, 45, 43, 41, 39, 37, 35, 33, 31, 29,
+         15, 45, 43, 41, 39, 37, 35, 33, 31]
     )
     mins = [m - 2 for m in seq]
     maxs = [m + 2 for m in seq]
@@ -320,9 +330,8 @@ def test_compute_plant_eta_from_slope():
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    _setup_plant(app, mo, mrows, cur_mo=31)
-    src = {"moisture_entity": mo}
-    res = app._compute_plant("p", src, app._history)
+    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=31)
+    res = app._compute_plant("p", src, history, latest)
     assert res["slope_7d"] is not None and res["slope_7d"] < 0
     assert res["slope_7d"] == pytest.approx(-2.0)
     assert res["eta_days"] is not None
@@ -330,11 +339,27 @@ def test_compute_plant_eta_from_slope():
     assert res["eta_days"] >= 0
 
 
-# ---- _write_entity ---------------------------------------------------------
+def test_compute_plant_uses_latest_for_current_moisture():
+    """_compute_plant reads current moisture from the `latest` dict (InfluxDB
+    last()), not from HA state. Regression guard for the InfluxDB-only path."""
+    app = make_app()
+    mo = "sensor.p_moisture"
+    seq = [45, 40, 35, 30, 25, 20, 15, 45, 40, 35, 30, 25, 20, 15, 45, 40]
+    mins = [m - 2 for m in seq]
+    maxs = [m + 2 for m in seq]
+    for wi in (7, 14):
+        maxs[wi] = seq[wi] + 10
+    mrows = [row(t, mn, mx, mean)
+             for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
+    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=20)
+    latest[mo] = 20.0  # current value comes from here, not any HA state
+    res = app._compute_plant("p", src, history, latest)
+    assert res["moisture"] == 20.0
 
+
+# ---- InfluxDB retry --------------------------------------------------------
 
 def test_influx_query_retries_then_succeeds(monkeypatch):
-    """Transient connection errors are retried; success returns the data."""
     app = make_app()
     calls = {"n": 0}
 
@@ -358,7 +383,6 @@ def test_influx_query_retries_then_succeeds(monkeypatch):
 
 
 def test_influx_query_4xx_not_retried(monkeypatch):
-    """A client error is not retried and returns {}."""
     app = make_app()
     calls = {"n": 0}
 
@@ -380,7 +404,6 @@ def test_influx_query_4xx_not_retried(monkeypatch):
 
 
 def test_influx_query_5xx_retried(monkeypatch):
-    """A 5xx is retried up to influx_retries, then returns {}."""
     app = make_app()
     app.influx_retries = 3
 
@@ -399,58 +422,132 @@ def test_influx_query_5xx_retried(monkeypatch):
     assert app._influx_query("SELECT 1") == {}
 
 
-# ---- _write_entity ---------------------------------------------------------
+# ---- _plant_mqtt_payloads --------------------------------------------------
 
-def test_write_entity_state_and_attributes():
-    app = make_app()
-    result = {
+def _result(**kw):
+    base = {
         "plant": "p1", "moisture_entity": "sensor.p1_moisture",
         "pot_size": "medium", "moisture": 20.0, "conductivity": 100.0,
-        "wet_ceiling": 45.0, "dry_floor": 15.0, "need_pct": 67,
+        "wet_ceiling": 45.0, "dry_floor": 15.0, "dryness": 67,
         "eta_days": 3.5, "confidence": "high", "status": "water soon",
         "slope_7d": -2.0, "waterings_detected": 4, "valid_waterings": 3,
     }
-    app._write_entity("p1", result)
-    written = app._set_states["sensor.drydown_p1"]
-    assert written["state"] == 67
-    assert written["attributes"]["confidence"] == "high"
-    assert written["attributes"]["eta_days"] == 3.5
-    assert written["attributes"]["friendly_name"] == "Drydown P1"
+    base.update(kw)
+    return base
 
 
-def test_write_entity_uncalibrated_state():
+def test_mqtt_payloads_structure():
     app = make_app()
-    result = {
-        "plant": "p2", "moisture_entity": "sensor.p2_moisture",
-        "pot_size": "medium", "moisture": None, "conductivity": None,
-        "wet_ceiling": None, "dry_floor": None, "need_pct": None,
-        "eta_days": "unknown", "confidence": "uncalibrated",
-        "status": "UNCALIBRATED", "slope_7d": None,
-        "waterings_detected": 0, "valid_waterings": 0,
-    }
-    app._write_entity("p2", result)
-    assert app._set_states["sensor.drydown_p2"]["state"] == "uncalibrated"
+    msgs = app._plant_mqtt_payloads("plant_4", _result())
+    # 11 metrics -> 22 messages (1 discovery + 1 state each), all retained.
+    assert len(msgs) == 22
+    assert all(r for _, _, r in msgs)
+    disc = [(t, p) for t, p, _ in msgs if t.endswith("/config")]
+    states = [(t, p) for t, p, _ in msgs if t.endswith("/state")]
+    assert len(disc) == 11 and len(states) == 11
 
 
-def test_write_entity_dry_run_does_not_write():
-    """In dry_run mode _write_entity logs and never calls set_state."""
+def test_mqtt_payloads_device_block_ties_entities():
+    app = make_app()
+    msgs = app._plant_mqtt_payloads("plant_4", _result())
+    # Every discovery message carries the same device block.
+    dev_jsons = set()
+    for topic, payload, _ in msgs:
+        if topic.endswith("/config"):
+            dev_jsons.add(json.dumps(json.loads(payload)["dev"]))
+    assert len(dev_jsons) == 1
+    dev = json.loads(next(iter(dev_jsons)))
+    assert dev == {"identifiers": ["drydown_plant_4"], "name": "Plant 4",
+                   "manufacturer": "drydown", "model": "Plant"}
+
+
+def test_mqtt_payloads_dryness_state_published():
+    app = make_app()
+    msgs = app._plant_mqtt_payloads("p1", _result(dryness=67))
+    st = {t: p for t, p, _ in msgs if t.endswith("/state")}
+    assert st["drydown/p1/dryness/state"] == "67"
+
+
+def test_mqtt_payloads_eta_numeric_only():
+    """ETA entity has unit 'd'; a numeric ETA publishes the number, but
+    'rising'/'unknown'/None publishes empty (entity goes unavailable)."""
+    app = make_app()
+    # numeric
+    msgs = app._plant_mqtt_payloads("p1", _result(eta_days=3.5))
+    st = {t: p for t, p, _ in msgs if t.endswith("/state")}
+    assert st["drydown/p1/next_watering_estimate/state"] == "3.5"
+    # string -> empty
+    msgs = app._plant_mqtt_payloads("p1", _result(eta_days="rising"))
+    st = {t: p for t, p, _ in msgs if t.endswith("/state")}
+    assert st["drydown/p1/next_watering_estimate/state"] == ""
+    # None -> empty
+    msgs = app._plant_mqtt_payloads("p1", _result(eta_days=None))
+    st = {t: p for t, p, _ in msgs if t.endswith("/state")}
+    assert st["drydown/p1/next_watering_estimate/state"] == ""
+
+
+def test_mqtt_payloads_uncalibrated_publishes_empty_numeric_states():
+    """Uncalibrated plant: dryness/wet_ceiling/etc are None -> empty state
+    (unavailable); status/confidence still publish their strings."""
+    app = make_app()
+    res = _result(dryness=None, wet_ceiling=None, dry_floor=None,
+                  moisture=None, conductivity=None, slope_7d=None,
+                  eta_days="unknown", confidence="uncalibrated",
+                  status="UNCALIBRATED", waterings_detected=0, valid_waterings=0)
+    st = {t: p for t, p, _ in app._plant_mqtt_payloads("p2", res)
+          if t.endswith("/state")}
+    assert st["drydown/p2/dryness/state"] == ""
+    assert st["drydown/p2/wet_ceiling/state"] == ""
+    assert st["drydown/p2/status/state"] == "UNCALIBRATED"
+    assert st["drydown/p2/confidence/state"] == "uncalibrated"
+    assert st["drydown/p2/waterings_detected/state"] == "0"
+
+
+def test_mqtt_payloads_renamed_entities_present():
+    """ETA -> 'Next Watering Estimate'; Slope 7d -> 'Drydown rate (7d)'."""
+    app = make_app()
+    configs = {}
+    for topic, payload, _ in app._plant_mqtt_payloads("p1", _result()):
+        if topic.endswith("/config"):
+            c = json.loads(payload)
+            configs[c["name"]] = c
+    assert "Next Watering Estimate" in configs
+    assert configs["Next Watering Estimate"]["dev_cla"] == "duration"
+    assert configs["Next Watering Estimate"]["unit_of_meas"] == "d"
+    assert "Drydown rate (7d)" in configs
+    assert configs["Drydown rate (7d)"]["unit_of_meas"] == "%/d"
+    # old names gone
+    assert "ETA" not in configs
+    assert "Slope 7d" not in configs
+    assert "Water Need" not in configs
+    assert "Dryness" in configs
+
+
+def test_publish_plant_dry_run_does_not_publish():
+    """In dry_run mode _publish_plant logs and never touches the MQTT client."""
     app = make_app()
     app.dry_run = True
-    result = {
-        "plant": "p3", "moisture_entity": "sensor.p3_moisture",
-        "pot_size": "large", "moisture": 20.0, "conductivity": 100.0,
-        "wet_ceiling": 45.0, "dry_floor": 15.0, "need_pct": 67,
-        "eta_days": 3.5, "confidence": "high", "status": "water soon",
-        "slope_7d": -2.0, "waterings_detected": 4, "valid_waterings": 3,
-    }
-    app._write_entity("p3", result)
-    # No entity created.
-    assert "sensor.drydown_p3" not in app._set_states
+    published = []
+    app._mqtt_client = type("C", (), {"publish": staticmethod(
+        lambda *a, **k: published.append((a, k)))})()
+    app._publish_plant("p1", _result())
+    assert published == []  # nothing published
+
+
+def test_publish_plant_publishes_all_payloads():
+    app = make_app()
+    published = []
+    app._mqtt_client = type("C", (), {"publish": staticmethod(
+        lambda topic, payload, qos=0, retain=False:
+            published.append((topic, payload, retain)))})()
+    app._publish_plant("p1", _result())
+    assert len(published) == 22
+    assert all(r is True for _, _, r in published)
 
 
 # ---- initialize scheduling -------------------------------------------------
 
-def test_initialize_builds_hourly_start_time(monkeypatch):
+def test_initialize_builds_hourly_start_time():
     captured = {}
 
     class App(dd.Drydown):
@@ -467,7 +564,7 @@ def test_initialize_builds_hourly_start_time(monkeypatch):
         "sensors": {},
         "jump_threshold": {"small": 15, "medium": 8, "large": 5},
         "schedule": {"hourly_update": {"type": "hourly", "minute": 5}},
+        "dry_run": True,  # skip _mqtt_connect (no broker / paho in tests)
     }
     app.initialize()
-    # The fix: minute is honored via a datetime.time, not a dropped kwarg.
     assert captured["start"] == dt.time(hour=0, minute=5)

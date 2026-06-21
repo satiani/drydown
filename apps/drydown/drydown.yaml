@@ -1,35 +1,27 @@
 ---
 # drydown app configuration.
 #
-# This file is read by AppDaemon and passed to the app as self.args.
-# AppDaemon requires the app to be nested under a named section (the app
-# name, used in logs) — `drydown:` here — with `module`/`class` and all
-# arguments inside it. A flat top-level `module:`/`class:` will be rejected
-# as a BadAppConfig.
+# AppDaemon requires the app nested under a named section (the app name, used
+# in logs) — `drydown:` here — with `module`/`class` and all arguments inside.
 #
-# This is the single source of truth for what sensors to track and how to
-# reach InfluxDB. Pot sizes are NOT configured here — they are attached as
-# attributes to the source moisture entities via HA's `customize` block in
-# /config/configuration.yaml, and read at runtime.
+# The app is a pure InfluxDB → MQTT transformer: it reads moisture/conductivity
+# history + latest values from InfluxDB and publishes one Home Assistant device
+# per plant (via MQTT discovery) with one sensor entity per metric. It reads
+# nothing from HA's state machine. Pot size is configured per-sensor here (not
+# via HA customize), since the app no longer reads HA state.
 #
-# dry_run: true computes everything and logs results as JSON without writing
-# any entities — use it to validate calibration against live data before
-# enabling for real (see README "Development").
+# dry_run: true computes everything and logs results as JSON without publishing
+# — useful for validating calibration against live data with no side effects.
 
 drydown:
   module: drydown
   class: Drydown
   dry_run: false
 
-  # InfluxDB connection (the a0d7b954_influxdb add-on, reachable by hostname
-  # from inside the HA Docker network). Adjust creds only if you've changed
-  # them from the add-on defaults.
-  #
-  # moisture_measurement / conductivity_measurement: the InfluxDB measurements
-  # to query, as raw FROM-clause tokens. The HA InfluxDB integration names
-  # measurements by unit_of_measurement, so defaults are "%" for moisture and
-  # a /.*S.cm/ regex for conductivity (robust to µ-encoding variants). Use a
-  # quoted literal '"name"' for an exact match or /regex/ for a pattern.
+  # InfluxDB connection. The HA InfluxDB integration names measurements by
+  # unit_of_measurement, so defaults are "%" for moisture and a /.*S.cm/ regex
+  # for conductivity (robust to µ-encoding variants). Override either as a
+  # quoted literal '"name"' or /regex/ if your schema differs.
   influxdb:
     host: a0d7b954-influxdb
     port: 8086
@@ -43,58 +35,60 @@ drydown:
   influx_retries: 3
   influx_backoff: 1.0
 
-  # How much history to pull per run for calibration.
+  # MQTT broker. The app publishes retained discovery + state here. Requires
+  # the Mosquitto broker add-on and HA's MQTT integration (see README). Use
+  # the same credentials the MQTT integration uses, or a dedicated HA user.
+  mqtt:
+    host: core-mosquitto
+    port: 1883
+    username: homeassistant
+    password: REPLACE_WITH_MQTT_PASSWORD
+
   lookback_days: 60
 
-  # Plant sensors to track. Key = the plant label used in the output entity id
-  # (sensor.drydown_<key>). Value = the source moisture entity id. The app
-  # derives conductivity / temperature entity ids by replacing the `_moisture`
-  # suffix.
+  # Plant sensors to track. Key = plant label (becomes the device name and the
+  # entity-id prefix). pot_size selects the adaptive watering-detection jump
+  # threshold (small 15, medium 8, large 5). Conductivity entity is derived by
+  # replacing `_moisture` with `_conductivity`.
   sensors:
     plant_1:
       moisture_entity: sensor.plant_sensor_1_moisture
+      pot_size: medium
     plant_2:
       moisture_entity: sensor.plant_sensor_2_moisture
+      pot_size: small
     plant_3:
       moisture_entity: sensor.plant_sensor_3_moisture
+      pot_size: medium
     plant_4:
       moisture_entity: sensor.plant_sensor_4_moisture
+      pot_size: large
     plant_5:
       moisture_entity: sensor.plant_sensor_5_moisture
+      pot_size: large
     plant_6:
       moisture_entity: sensor.plant_sensor_6_moisture
+      pot_size: medium
     plant_7:
       moisture_entity: sensor.living_room_plant_sensor_7_moisture
+      pot_size: medium
     plant_8:
       moisture_entity: sensor.kitchen_plant_sensor_8_moisture
+      pot_size: medium
     plant_9:
       moisture_entity: sensor.kitchen_plant_sensor_9_moisture
+      pot_size: medium
 
-  # Adaptive moisture-jump threshold (in % points) for watering detection, by
-  # pot size. A shallow probe in a large pot barely moves when watered, so the
-  # threshold scales down with pot size.
   jump_threshold:
     small: 15
     medium: 8
     large: 5
 
-  # A watering only counts as a "valid dry-trigger watering" (informative for
-  # the dry floor) if the pre-watering moisture was below this fraction of the
-  # wet ceiling. Filters out mass-waterings of still-moist plants.
   valid_watering_floor_fraction: 0.65
-
-  # Margin (in %-points/day) a watering-day moisture slope must exceed the
-  # prior day's slope by to count as a rate reversal. Tunes how aggressively
-  # slope flattening alone (without a jump) triggers a watering detection.
   slope_reversal_margin: 1.0
+  confidence_valid_for_medium: 1
+  confidence_valid_for_high: 3
 
-  # Confidence tier thresholds (count of valid dry-trigger waterings).
-  confidence_valid_for_medium: 1   # >= this -> medium
-  confidence_valid_for_high: 3     # >= this -> high
-
-  # Scheduling. The app runs hourly, recomputing everything from the latest
-  # InfluxDB pull each time. (A separate daily recalibration path is deferred
-  # to Pass B, where hourly runs will reuse cached calibration.)
   schedule:
     hourly_update:
       type: hourly
