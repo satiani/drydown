@@ -16,7 +16,7 @@ One device (e.g. "Plant 4") with these sensor entities, each with a sensible ico
 | Next Watering Estimate | d | days until water needed (unavailable when it can't be estimated) |
 | Wet Ceiling | % | learned field-capacity plateau |
 | Dry Floor | % | learned trigger floor |
-| Drydown rate (7d) | %/d | moisture dry-down rate |
+| Drydown rate (3d) | %/d | moisture dry-down rate |
 | Status | — | ok / water soon / WATER NOW / UNCALIBRATED |
 | Confidence | — | uncalibrated / low / medium / high |
 | Waterings Detected | — | count of watering events learned from |
@@ -30,7 +30,7 @@ The dry floor is **purely learned** from detected watering events — no heurist
 - **Dry floor** — the driest pre-watering moisture among *valid* waterings. A watering is valid only if pre-watering moisture was below 65% of the wet ceiling, filtering out mass-waterings of still-moist plants.
 - **Watering detection** — from the moisture reading alone: a watering is detected on a day where the max moisture jumps ≥ `jump_threshold` above the previous day's mean **or** the dry-down slope reverses. The threshold is adaptive by pot size (small 15, medium 8, large 5).
 - **Dryness** — `clamp((wet_ceiling − current) / (wet_ceiling − dry_floor) × 100, 0, 100)`.
-- **Next Watering Estimate** — `(current − dry_floor) / −slope_7d`.
+- **Next Watering Estimate** — `(current − dry_floor) / −slope_3d`.
 
 ## Requirements
 

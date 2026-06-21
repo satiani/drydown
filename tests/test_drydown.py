@@ -51,9 +51,9 @@ def make_app(**overrides):
     return app
 
 
-def row(t, mn, mx, mean, cnt=24):
+def row(t, mn, mx, mean, cnt=24, last=None):
     """Build a daily-aggregate row like _pull_history produces."""
-    return {"t": t, "mn": mn, "mx": mx, "mean": mean, "cnt": cnt}
+    return {"t": t, "mn": mn, "mx": mx, "mean": mean, "last": mean if last is None else last, "cnt": cnt}
 
 
 def dates(start="2024-01-01", n=10):
@@ -62,14 +62,17 @@ def dates(start="2024-01-01", n=10):
 
 
 def _setup_plant(app, moist_entity, mrows, cur_mo, pot_size="medium"):
-    """Wire a plant's history + latest values into the app for _compute_plant.
+    """Wire a plant's history into the app for _compute_plant.
 
-    Returns (src, history, latest) ready to pass to _compute_plant."""
+    Returns (src, history) ready to pass to _compute_plant. The current
+    reading is the `last` selector of the final moisture row, so cur_mo is
+    stamped onto that row (matching how _pull_history + _last_value work)."""
     cond = moist_entity.replace("_moisture", "_conductivity")
     src = {"moisture_entity": moist_entity, "pot_size": pot_size}
+    if mrows:
+        mrows[-1] = dict(mrows[-1], last=cur_mo)
     history = {moist_entity: mrows, cond: []}
-    latest = {moist_entity: cur_mo, cond: 100}
-    return src, history, latest
+    return src, history
 
 
 # ---- _bare_eid / _entity_filter -------------------------------------------
@@ -92,7 +95,7 @@ def test_entity_filter_matches_bare_or_full():
     assert " OR " in f
 
 
-# ---- _pull_history / _pull_latest (bare-tag keying) -----------------------
+# ---- _pull_history / _last_value (bare-tag keying) -----------------------
 
 def test_pull_history_keys_by_full_id_for_bare_tags():
     """HA's InfluxDB stores entity_id WITHOUT the domain prefix (domain is a
@@ -106,6 +109,7 @@ def test_pull_history_keys_by_full_id_for_bare_tags():
 
     # Canned InfluxDB response keyed off the measurement in the query:
     # HA's schema stores the entity_id tag WITHOUT the domain prefix.
+    # Columns match the merged SELECT: min, max, mean, last, count.
     def fake_query(q):
         if ".*S.cm" in q:
             tag = "plant_1_conductivity"
@@ -113,10 +117,10 @@ def test_pull_history_keys_by_full_id_for_bare_tags():
             tag = "plant_1_moisture"
         return {"series": [{
             "tags": {"entity_id": tag, "domain": "sensor"},
-            "columns": ["time", "min", "max", "mean", "count"],
+            "columns": ["time", "min", "max", "mean", "last", "count"],
             "values": [
-                ["2024-01-01T00:00:00Z", 10, 20, 15, 24],
-                ["2024-01-02T00:00:00Z", 12, 22, 17, 24],
+                ["2024-01-01T00:00:00Z", 10, 20, 15, 18, 24],
+                ["2024-01-02T00:00:00Z", 12, 22, 17, 22, 24],
             ],
         }]}
 
@@ -126,33 +130,31 @@ def test_pull_history_keys_by_full_id_for_bare_tags():
     assert "plant_1_moisture" not in history
     assert len(history["sensor.plant_1_moisture"]) == 2
     assert history["sensor.plant_1_moisture"][0]["t"] == "2024-01-01"
+    # The merged query carries the per-day `last` selector used as "current".
+    assert history["sensor.plant_1_moisture"][1]["last"] == 22
 
 
-def test_pull_latest_keys_by_full_id_and_takes_last():
-    """_pull_latest replaces the websocket get_state path: batched last()
-    queries, re-keyed by the full config id."""
+def test_last_value_takes_final_non_null_last():
+    """_last_value returns the most recent non-null `last` across daily rows
+    — the entity's current reading, replacing the old separate last() query."""
     app = make_app()
-    app.sensors = {
-        "plant_1": {"moisture_entity": "sensor.plant_1_moisture"},
-    }
+    rows = [
+        {"t": "2024-01-01", "last": 18},
+        {"t": "2024-01-02", "last": 22},
+    ]
+    assert app._last_value(rows) == 22
 
-    def fake_query(q):
-        assert "last" in q
-        if ".*S.cm" in q:
-            tag = "plant_1_conductivity"
-        else:
-            tag = "plant_1_moisture"
-        # last() GROUP BY entity_id -> columns ["time","last"], one row.
-        return {"series": [{
-            "tags": {"entity_id": tag},
-            "columns": ["time", "last"],
-            "values": [["2024-01-02T00:00:00Z", 28]],
-        }]}
 
-    app._influx_query = fake_query
-    latest = app._pull_latest()
-    assert latest == {"sensor.plant_1_moisture": 28,
-                      "sensor.plant_1_conductivity": 28}
+def test_last_value_skips_trailing_null_last():
+    """A trailing day with null `last` (no readings) is skipped in favor of
+    the previous day's last; an all-null/empty history returns None."""
+    app = make_app()
+    assert app._last_value([
+        {"t": "d1", "last": 30},
+        {"t": "d2", "last": None},
+    ]) == 30
+    assert app._last_value([{"t": "d1", "last": None}]) is None
+    assert app._last_value([]) is None
 
 
 # ---- _linear_slope ---------------------------------------------------------
@@ -236,8 +238,8 @@ def test_compute_plant_uncalibrated_with_no_events():
     app = make_app()
     mo = "sensor.p_moisture"
     mrows = [row(t, 30, 31, 30) for t in dates(n=20)]
-    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=30)
-    res = app._compute_plant("p", src, history, latest)
+    src, history = _setup_plant(app, mo, mrows, cur_mo=30)
+    res = app._compute_plant("p", src, history)
     assert res["confidence"] == "uncalibrated"
     assert res["status"] == "UNCALIBRATED"
     assert res["dryness"] is None
@@ -255,8 +257,8 @@ def test_compute_plant_uncalibrated_when_events_but_none_valid():
     maxs[4] = 50
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(means)), mins, maxs, means)]
-    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=41)
-    res = app._compute_plant("p", src, history, latest)
+    src, history = _setup_plant(app, mo, mrows, cur_mo=41)
+    res = app._compute_plant("p", src, history)
     assert res["waterings_detected"] >= 1
     assert res["valid_waterings"] == 0
     assert res["confidence"] == "uncalibrated"   # NOT "low"
@@ -278,8 +280,8 @@ def test_compute_plant_calibrated_high_confidence():
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=20)
-    res = app._compute_plant("p", src, history, latest)
+    src, history = _setup_plant(app, mo, mrows, cur_mo=20)
+    res = app._compute_plant("p", src, history)
     assert res["confidence"] == "high"
     assert res["valid_waterings"] >= 3
     assert res["wet_ceiling"] is not None
@@ -299,8 +301,8 @@ def test_compute_plant_dryness_clamps_at_floor():
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=10)  # below floor
-    res = app._compute_plant("p", src, history, latest)
+    src, history = _setup_plant(app, mo, mrows, cur_mo=10)  # below floor
+    res = app._compute_plant("p", src, history)
     assert res["dryness"] == 100
     assert res["status"] == "WATER NOW"
 
@@ -315,8 +317,8 @@ def test_compute_plant_just_watered_is_zero():
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=45)  # at ceiling
-    res = app._compute_plant("p", src, history, latest)
+    src, history = _setup_plant(app, mo, mrows, cur_mo=45)  # at ceiling
+    res = app._compute_plant("p", src, history)
     assert res["dryness"] == 0
     assert res["status"] == "ok"
 
@@ -335,18 +337,19 @@ def test_compute_plant_eta_from_slope():
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=31)
-    res = app._compute_plant("p", src, history, latest)
-    assert res["slope_7d"] is not None and res["slope_7d"] < 0
-    assert res["slope_7d"] == pytest.approx(-2.0)
+    src, history = _setup_plant(app, mo, mrows, cur_mo=31)
+    res = app._compute_plant("p", src, history)
+    assert res["slope_3d"] is not None and res["slope_3d"] < 0
+    assert res["slope_3d"] == pytest.approx(-2.0)
     assert res["eta_days"] is not None
     assert isinstance(res["eta_days"], float)
     assert res["eta_days"] >= 0
 
 
 def test_compute_plant_uses_latest_for_current_moisture():
-    """_compute_plant reads current moisture from the `latest` dict (InfluxDB
-    last()), not from HA state. Regression guard for the InfluxDB-only path."""
+    """_compute_plant reads current moisture from the history's final `last`
+    selector (InfluxDB last()), not from HA state. Regression guard for the
+    InfluxDB-only path."""
     app = make_app()
     mo = "sensor.p_moisture"
     seq = [45, 40, 35, 30, 25, 20, 15, 45, 40, 35, 30, 25, 20, 15, 45, 40]
@@ -356,9 +359,9 @@ def test_compute_plant_uses_latest_for_current_moisture():
         maxs[wi] = seq[wi] + 10
     mrows = [row(t, mn, mx, mean)
              for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    src, history, latest = _setup_plant(app, mo, mrows, cur_mo=20)
-    latest[mo] = 20.0  # current value comes from here, not any HA state
-    res = app._compute_plant("p", src, history, latest)
+    src, history = _setup_plant(app, mo, mrows, cur_mo=20.0)
+    # current value comes from the final moisture row's `last`, not any HA state
+    res = app._compute_plant("p", src, history)
     assert res["moisture"] == 20.0
 
 
@@ -435,7 +438,7 @@ def _result(**kw):
         "pot_size": "medium", "moisture": 20.0, "conductivity": 100.0,
         "wet_ceiling": 45.0, "dry_floor": 15.0, "dryness": 67,
         "eta_days": 3.5, "confidence": "high", "status": "water soon",
-        "slope_7d": -2.0, "waterings_detected": 4, "valid_waterings": 3,
+        "slope_3d": -2.0, "waterings_detected": 4, "valid_waterings": 3,
     }
     base.update(kw)
     return base
@@ -496,7 +499,7 @@ def test_mqtt_payloads_uncalibrated_publishes_empty_numeric_states():
     (unavailable); status/confidence still publish their strings."""
     app = make_app()
     res = _result(dryness=None, wet_ceiling=None, dry_floor=None,
-                  moisture=None, conductivity=None, slope_7d=None,
+                  moisture=None, conductivity=None, slope_3d=None,
                   eta_days="unknown", confidence="uncalibrated",
                   status="UNCALIBRATED", waterings_detected=0, valid_waterings=0)
     st = {t: p for t, p, _ in app._plant_mqtt_payloads("p2", res)
@@ -509,7 +512,7 @@ def test_mqtt_payloads_uncalibrated_publishes_empty_numeric_states():
 
 
 def test_mqtt_payloads_renamed_entities_present():
-    """ETA -> 'Next Watering Estimate'; Slope 7d -> 'Drydown rate (7d)'."""
+    """ETA -> 'Next Watering Estimate'; Slope 3d -> 'Drydown rate (3d)'."""
     app = make_app()
     configs = {}
     for topic, payload, _ in app._plant_mqtt_payloads("p1", _result()):
@@ -519,10 +522,11 @@ def test_mqtt_payloads_renamed_entities_present():
     assert "Next Watering Estimate" in configs
     assert configs["Next Watering Estimate"]["dev_cla"] == "duration"
     assert configs["Next Watering Estimate"]["unit_of_meas"] == "d"
-    assert "Drydown rate (7d)" in configs
-    assert configs["Drydown rate (7d)"]["unit_of_meas"] == "%/d"
+    assert "Drydown rate (3d)" in configs
+    assert configs["Drydown rate (3d)"]["unit_of_meas"] == "%/d"
     # old names gone
     assert "ETA" not in configs
+    assert "Slope 3d" not in configs
     assert "Slope 7d" not in configs
     assert "Water Need" not in configs
     assert "Dryness" in configs

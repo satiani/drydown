@@ -72,17 +72,16 @@ class Drydown(hass.Hass):
     # ---- Orchestration ------------------------------------------------------
 
     def _run_all(self, kwargs):
-        """Pull history + latest from InfluxDB, compute per-plant, publish."""
+        """Pull history (+ latest) from InfluxDB, compute per-plant, publish."""
         try:
             self.log("drydown run starting")
             history = self._pull_history()
             if not history:
                 self.log("drydown: no history pulled, skipping", level="WARNING")
                 return
-            latest = self._pull_latest()
             for plant_key, src in self.sensors.items():
                 try:
-                    result = self._compute_plant(plant_key, src, history, latest)
+                    result = self._compute_plant(plant_key, src, history)
                 except Exception as e:
                     self.log("drydown: error computing %s: %s", plant_key, e, level="ERROR")
                     continue
@@ -110,12 +109,18 @@ class Drydown(hass.Hass):
         return " OR ".join(clauses)
 
     def _pull_history(self):
-        """Return {entity_id: [{'t':'YYYY-MM-DD','mn','mx','mean','cnt'}, ...]}.
+        """Return {entity_id: [{'t','mn','mx','mean','last','cnt'}, ...]}.
 
-        Daily aggregates for moisture and conductivity over the lookback
-        window, in two batched queries. All time math is UTC: the cutoff is
-        UTC midnight and InfluxDB's time(1d) buckets are UTC by default, so
-        day boundaries are deterministic regardless of AppDaemon's tz.
+        Daily aggregates plus the latest point per day for moisture and
+        conductivity over the lookback window, in two batched queries. The
+        per-day `last` selector also serves as the "current" reading: the
+        single most recent point overall is the `last` of the final non-empty
+        day's bucket (see _last_value), so a separate last() query is
+        unnecessary — one query per measurement does both jobs.
+
+        All time math is UTC: the cutoff is UTC midnight and InfluxDB's
+        time(1d) buckets are UTC by default, so day boundaries are
+        deterministic regardless of AppDaemon's tz.
         """
         now = dt.datetime.now(dt.timezone.utc)
         since = (now - dt.timedelta(days=self.lookback_days)).strftime("%Y-%m-%d")
@@ -129,7 +134,8 @@ class Drydown(hass.Hass):
             if not ids:
                 continue
             ors = self._entity_filter(ids)
-            q = (f'SELECT min("value"), max("value"), mean("value"), count("value") '
+            q = (f'SELECT min("value"), max("value"), mean("value"), '
+                 f'last("value"), count("value") '
                  f'FROM {measurement} WHERE ({ors}) AND time >= \'{since}\' '
                  f'GROUP BY time(1d), "entity_id" fill(null)')
             data = self._influx_query(q)
@@ -146,10 +152,13 @@ class Drydown(hass.Hass):
                     if rec.get("min") is None:
                         continue
                     rows.append({
+                        # time(1d) buckets -> one row per UTC day, so [:10]
+                        # strips the identical T00:00:00Z suffix.
                         "t": rec["time"][:10],
                         "mn": rec["min"],
                         "mx": rec["max"],
                         "mean": rec["mean"],
+                        "last": rec["last"],
                         "cnt": rec["count"],
                     })
                 out.setdefault(eid, []).extend(rows)
@@ -158,36 +167,18 @@ class Drydown(hass.Hass):
             out[eid].sort(key=lambda r: r["t"])
         return out
 
-    def _pull_latest(self):
-        """Return {full_entity_id: latest_value} for moisture + conductivity.
+    @staticmethod
+    def _last_value(rows):
+        """Return the most recent non-null `last` selector across daily rows.
 
-        Batched last() queries. This replaces reading HA's live state via the
-        websocket, so the app is a pure InfluxDB → MQTT transformer with a
-        single transport. The latest point may lag the live state by up to the
-        InfluxDB integration's write interval (~1 min) — irrelevant for an
-        hourly-recalibrated indicator.
+        The per-day `last` carried by _pull_history is the latest point in
+        that day's bucket, so the most recent non-null one across the window
+        is the entity's current reading — no separate last() query needed.
         """
-        out = {}
-        moisture_ids = [s["moisture_entity"] for s in self.sensors.values()]
-        cond_ids = [m.replace("_moisture", "_conductivity") for m in moisture_ids]
-
-        for ids, measurement in [(moisture_ids, self.moisture_measurement),
-                                 (cond_ids, self.conductivity_measurement)]:
-            if not ids:
-                continue
-            ors = self._entity_filter(ids)
-            q = (f'SELECT last("value") FROM {measurement} '
-                 f'WHERE ({ors}) GROUP BY "entity_id"')
-            data = self._influx_query(q)
-            bare_to_full = {self._bare_eid(e): e for e in ids}
-            for series in data.get("series", []):
-                eid_tag = series.get("tags", {}).get("entity_id")
-                eid = bare_to_full.get(eid_tag, eid_tag)
-                vals = series.get("values", [])
-                # columns: ["time", "last"]; one row per entity.
-                if vals and vals[0] and len(vals[0]) > 1 and vals[0][1] is not None:
-                    out[eid] = vals[0][1]
-        return out
+        for r in reversed(rows):
+            if r.get("last") is not None:
+                return r["last"]
+        return None
 
     def _influx_query(self, q):
         url = "http://%s:%s/query" % (self._influx["host"], self._influx["port"])
@@ -252,14 +243,14 @@ class Drydown(hass.Hass):
 
     # ---- Per-plant computation ---------------------------------------------
 
-    def _compute_plant(self, plant_key, src, history, latest):
+    def _compute_plant(self, plant_key, src, history):
         moist_entity = src["moisture_entity"]
         cond_entity = moist_entity.replace("_moisture", "_conductivity")
 
         mrows = history.get(moist_entity, [])
         crows = history.get(cond_entity, [])
-        cur_mo = latest.get(moist_entity)
-        cur_co = latest.get(cond_entity)
+        cur_mo = self._last_value(mrows)
+        cur_co = self._last_value(crows)
 
         pot_size = src.get("pot_size", "medium")
         jump_thresh = self.jump_threshold.get(pot_size, self.jump_threshold["medium"])
@@ -276,7 +267,7 @@ class Drydown(hass.Hass):
             "eta_days": None,
             "confidence": "uncalibrated",
             "status": "UNCALIBRATED",
-            "slope_7d": None,
+            "slope_3d": None,
             "waterings_detected": 0,
             "valid_waterings": 0,
         }
@@ -287,16 +278,16 @@ class Drydown(hass.Hass):
             return result
 
         # ---- Detect watering events ----
-        events = self._detect_waterings(mrows, crows, jump_thresh)
-        result["waterings_detected"] = len(events)
+        watering_events = self._detect_waterings(mrows, crows, jump_thresh)
+        result["waterings_detected"] = len(watering_events)
 
         # No watering observed yet -> cannot calibrate. Stay uncalibrated
         # rather than fabricating a floor from percentiles of raw readings.
-        if not events:
+        if not watering_events:
             return result
 
         # ---- Wet ceiling: median of post-watering plateaus ----
-        plateaus = [e["plateau"] for e in events if e["plateau"] is not None]
+        plateaus = [e["plateau"] for e in watering_events if e["plateau"] is not None]
         wet = statistics.median(plateaus) if plateaus else None
         result["wet_ceiling"] = round(wet, 1) if wet is not None else None
 
@@ -307,7 +298,7 @@ class Drydown(hass.Hass):
         # A watering is "valid" only if the plant had actually dried first
         # (pre-watering moisture < 65% of wet ceiling), filtering out
         # mass-waterings of still-moist plants.
-        valid = [e for e in events if e["pre_min"] is not None
+        valid = [e for e in watering_events if e["pre_min"] is not None
                  and e["pre_min"] < self.valid_floor_frac * wet]
         result["valid_waterings"] = len(valid)
 
@@ -338,9 +329,15 @@ class Drydown(hass.Hass):
             need = None
         result["dryness"] = need
 
-        # ---- Slope (7-day) and ETA ----
-        slope = self._slope(mrows, n=7)
-        result["slope_7d"] = round(slope, 2) if slope is not None else None
+        # ---- Slope (current dry-down cycle, capped at 3 days) and ETA ----
+        # Only rows since the last detected watering reflect the current
+        # dry-down; older rows would dilute the rate. Window = days since
+        # the last watering, capped at 3 so the estimate stays responsive.
+        last_event_d = dt.date.fromisoformat(watering_events[-1]["date"])
+        last_row_d = dt.date.fromisoformat(mrows[-1]["t"])
+        days_since = max(0, (last_row_d - last_event_d).days)
+        slope = self._slope(mrows, n=min(days_since, 3))
+        result["slope_3d"] = round(slope, 2) if slope is not None else None
         if slope is not None and slope < 0 and cur_mo is not None:
             days = (cur_mo - dry_floor) / (-slope)
             result["eta_days"] = round(max(0.0, days), 1)
@@ -412,6 +409,8 @@ class Drydown(hass.Hass):
 
     def _slope(self, rows, n=7):
         """Least-squares slope of `mean` over the last n rows. Needs >=3 pts."""
+        if n < 1:
+            return None
         ys = [r["mean"] for r in rows[-n:] if r["mean"] is not None]
         return self._linear_slope(ys) if len(ys) >= 3 else None
 
@@ -450,7 +449,7 @@ class Drydown(hass.Hass):
             {"obj": "dry_floor", "name": "Dry Floor", "key": "dry_floor",
              "dev_cla": "moisture", "unit": "%", "icon": "mdi:water-outline",
              "stat_cla": "measurement"},
-            {"obj": "drydown_rate_7d", "name": "Drydown rate (7d)", "key": "slope_7d",
+            {"obj": "drydown_rate_3d", "name": "Drydown rate (3d)", "key": "slope_3d",
              "unit": "%/d", "icon": "mdi:trending-down", "stat_cla": "measurement"},
             {"obj": "status", "name": "Status", "key": "status", "icon": "mdi:leaf"},
             {"obj": "confidence", "name": "Confidence", "key": "confidence",
