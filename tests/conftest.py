@@ -9,7 +9,6 @@ the bits it needs.
 
 from __future__ import annotations
 
-import datetime as dt
 import os
 import sys
 import types
