@@ -465,7 +465,7 @@ def test_mqtt_payloads_device_block_ties_entities():
             dev_jsons.add(json.dumps(json.loads(payload)["dev"]))
     assert len(dev_jsons) == 1
     dev = json.loads(next(iter(dev_jsons)))
-    assert dev == {"identifiers": ["drydown_plant_4"], "name": "Plant 4",
+    assert dev == {"identifiers": ["drydown_plant_4"], "name": "Plant 4 Drydown",
                    "manufacturer": "drydown", "model": "Plant"}
 
 

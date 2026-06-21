@@ -472,7 +472,11 @@ class Drydown(hass.Hass):
         """
         dev = {
             "identifiers": ["drydown_%s" % plant_key],
-            "name": plant_key.replace("_", " ").title(),
+            # Suffix distinguishes this drydown device (derived/calibrated
+            # entities) from the BLE integration's "Plant N Sensor" device
+            # (raw readings). identifiers stay stable so HA renames in place
+            # instead of creating a second device.
+            "name": "%s Drydown" % plant_key.replace("_", " ").title(),
             "manufacturer": "drydown",
             "model": "Plant",
         }
