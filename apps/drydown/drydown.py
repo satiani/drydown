@@ -329,14 +329,17 @@ class Drydown(hass.Hass):
             need = None
         result["dryness"] = need
 
-        # ---- Slope (current dry-down cycle, capped at 3 days) and ETA ----
+        # ---- Slope (current dry-down cycle, last 3 readings) and ETA ----
         # Only rows since the last detected watering reflect the current
-        # dry-down; older rows would dilute the rate. Window = days since
-        # the last watering, capped at 3 so the estimate stays responsive.
+        # dry-down; older rows would dilute the rate. Sensors may skip days
+        # when readings haven't changed, so the last 3 *calendar* days may
+        # contain fewer than 3 readings or span more than 3 days. Use the
+        # last 3 actual reading-days from the current cycle and regress
+        # against their real dates for a correct %/day rate.
         last_event_d = dt.date.fromisoformat(watering_events[-1]["date"])
-        last_row_d = dt.date.fromisoformat(mrows[-1]["t"])
-        days_since = max(0, (last_row_d - last_event_d).days)
-        slope = self._slope(mrows, n=min(days_since, 3))
+        post = [r for r in mrows
+                if dt.date.fromisoformat(r["t"]) > last_event_d]
+        slope = self._slope(post, n=3)
         result["slope_3d"] = round(slope, 2) if slope is not None else None
         if slope is not None and slope < 0 and cur_mo is not None:
             days = (cur_mo - dry_floor) / (-slope)
@@ -372,14 +375,19 @@ class Drydown(hass.Hass):
                 continue
             # Jump: today's max well above yesterday's mean.
             jump = cur["mx"] >= prev["mean"] + jump_thresh
-            # Rate reversal: slope over days i-1..i exceeds the prior slope
-            # by slope_reversal_margin (flattening/rising after draining).
+            # Rate reversal: the post-slope must be flat-or-positive
+            # (drainage has actually stopped/reversed), AND exceed the prior
+            # draining slope by slope_reversal_margin. Requiring non-negative
+            # post_slope avoids false positives where a plant's dry-down merely
+            # decelerates as it nears its dry floor — a slower decline is not a
+            # watering.
             reversed_ = False
             if i >= 2:
                 pre_slope = self._seg_slope(mrows, i - 2, i)      # days i-2..i-1
                 post_slope = self._seg_slope(mrows, i - 1, i + 1)  # days i-1..i
                 if pre_slope is not None and post_slope is not None:
-                    reversed_ = post_slope > pre_slope + self.slope_reversal_margin
+                    reversed_ = (post_slope >= 0
+                                 and post_slope > pre_slope + self.slope_reversal_margin)
             if not (jump or reversed_):
                 continue
             # Plateau = max daily mean in days i+1..i+4 (settled after drain).
@@ -408,18 +416,29 @@ class Drydown(hass.Hass):
         return self._linear_slope(ys) if len(ys) >= 2 else None
 
     def _slope(self, rows, n=7):
-        """Least-squares slope of `mean` over the last n rows. Needs >=3 pts."""
+        """Least-squares slope of `mean` (%/day) over the last n reading-days,
+        using each row's actual date as x so sensors that skip days don't
+        distort the rate. Needs >=3 pts."""
         if n < 1:
             return None
-        ys = [r["mean"] for r in rows[-n:] if r["mean"] is not None]
-        return self._linear_slope(ys) if len(ys) >= 3 else None
+        pts = [(dt.date.fromisoformat(r["t"]), r["mean"]) for r in rows[-n:]
+               if r["mean"] is not None]
+        if len(pts) < 3:
+            return None
+        xs = [d.toordinal() for d, _ in pts]
+        ys = [y for _, y in pts]
+        return self._linear_slope_xy(xs, ys)
 
     @staticmethod
     def _linear_slope(ys):
         """Least-squares slope of ys vs integer index, or None if degenerate."""
+        return Drydown._linear_slope_xy(list(range(len(ys))), ys)
+
+    @staticmethod
+    def _linear_slope_xy(xs, ys):
+        """Least-squares slope of ys vs xs, or None if degenerate."""
         if len(ys) < 2:
             return None
-        xs = list(range(len(ys)))
         mx = statistics.mean(xs)
         my = statistics.mean(ys)
         num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))

@@ -192,6 +192,28 @@ def test_seg_slope_slice_bounds():
     assert app._seg_slope(rows, -5, 2) == pytest.approx(-2.0)
 
 
+def test_slope_uses_real_dates_when_days_skipped():
+    """Sensors may not report for days when readings haven't changed; the
+    last 3 reading-days can span more than 3 calendar days. The rate must be
+    computed against the rows' real dates (%/day), not integer indices, so a
+    4-day gap isn't treated as a 1-day step."""
+    app = make_app()
+    # 3 reading-days spanning 8 calendar days: 30 -> 26 -> 22 = -1 %/day.
+    # Integer-index regression would wrongly report -4 %/day.
+    rows = [row("2024-01-01", 0, 0, 30),
+            row("2024-01-05", 0, 0, 26),
+            row("2024-01-09", 0, 0, 22)]
+    assert app._slope(rows, n=3) == pytest.approx(-1.0)
+
+
+def test_slope_consecutive_dates_matches_integer_regression():
+    """When reading-days are consecutive, date-based slope equals the old
+    integer-index slope."""
+    app = make_app()
+    rows = [row(t, 0, 0, m) for t, m in zip(dates(n=3), [10, 8, 6])]
+    assert app._slope(rows, n=3) == pytest.approx(-2.0)
+
+
 # ---- _detect_waterings -----------------------------------------------------
 
 def test_detect_watering_jump():
@@ -214,6 +236,31 @@ def test_detect_no_watering_when_steady():
     means = [30, 30, 30, 30, 30]
     mrows = [row(t, m - 1, m + 1, m) for t, m in zip(dates(n=5), means)]
     assert app._detect_waterings(mrows, [], jump_thresh=8) == []
+
+
+def test_detect_no_watering_from_decelerating_decline():
+    """A dry-down that merely decelerates as it nears the dry floor is NOT a
+    watering. The post-slope is still negative (still draining), so even though
+    it exceeds the prior steep slope by more than the margin, no event fires.
+    Regression guard for the false-positive that zeroed out slope_3d on a
+    plant whose rate flattened from -5.4/d to -1.3/d near its floor."""
+    app = make_app()
+    # Steep decline then flattening — still all negative, never reverses.
+    means = [30, 24, 20, 17, 16, 15.5, 15.2]
+    mrows = [row(t, m - 1, m + 1, m) for t, m in zip(dates(n=len(means)), means)]
+    assert app._detect_waterings(mrows, [], jump_thresh=8) == []
+
+
+def test_detect_watering_on_genuine_reversal():
+    """A true reversal — moisture stops draining and rises — is detected via
+    the slope-reversal path (no jump needed) when post-slope goes positive."""
+    app = make_app()
+    # Drain down to 15, then rebound to 16, 17 (positive post-slope).
+    means = [25, 20, 17, 15, 16, 17]
+    mrows = [row(t, m - 1, m + 1, m) for t, m in zip(dates(n=len(means)), means)]
+    events = app._detect_waterings(mrows, [], jump_thresh=8)
+    assert len(events) == 1
+    assert events[0]["date"] == dates(n=len(means))[4]
 
 
 def test_detect_watering_near_end_has_no_bogus_plateau():
@@ -321,6 +368,31 @@ def test_compute_plant_just_watered_is_zero():
     res = app._compute_plant("p", src, history)
     assert res["dryness"] == 0
     assert res["status"] == "ok"
+
+
+def test_compute_plant_slope_excludes_pre_watering_rows():
+    """The 3-day slope must use only rows from the current dry-down cycle
+    (after the last watering), never pre-watering rows — even when the
+    sensor skipped days and post-watering readings are sparse. With fewer
+    than 3 post-watering reading-days, slope is None rather than reaching
+    back across the watering boundary."""
+    app = make_app()
+    mo = "sensor.p_moisture"
+    # Watering spike on 2024-01-05; only 2 post-watering reading-days after.
+    # Pre-watering rows must NOT be pulled in to reach 3 points.
+    mrows = [
+        row("2024-01-01", 43, 45, 44),
+        row("2024-01-02", 39, 41, 40),
+        row("2024-01-03", 35, 37, 36),
+        row("2024-01-04", 15, 17, 16),   # pre-watering low
+        row("2024-01-05", 15, 55, 45, last=45),  # watering day (spike in max)
+        row("2024-01-06", 41, 43, 42),
+        row("2024-01-10", 33, 35, 34),
+    ]
+    src, history = _setup_plant(app, mo, mrows, cur_mo=34)
+    res = app._compute_plant("p", src, history)
+    # Only 2 post-watering reading-days -> not enough for a 3-point slope.
+    assert res["slope_3d"] is None
 
 
 def test_compute_plant_eta_from_slope():
