@@ -59,6 +59,8 @@ drydown:
       moisture_entity: sensor.kitchen_plant_sensor_8_moisture
     plant_9:
       moisture_entity: sensor.kitchen_plant_sensor_9_moisture
+    plant_10:
+      moisture_entity: sensor.master_bedroom_plant_sensor_10_moisture
 
   # A watering is detected when a day's peak moisture jumps this many points
   # above the previous day's peak. Real waterings spike by tens of %; sensor

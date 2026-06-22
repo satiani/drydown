@@ -64,6 +64,10 @@ def _install_appdaemon_stub() -> None:
         def run_hourly(self, callback, start=None, **kwargs):
             return None
 
+        # Events ----------------------------------------------------------
+        def listen_event(self, callback, event=None, **kwargs):
+            return None
+
     hassapi.Hass = Hass
 
     ad.plugins = pkg_hass

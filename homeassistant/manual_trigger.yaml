@@ -1,0 +1,43 @@
+---
+# drydown manual trigger — Home Assistant side.
+#
+# The AppDaemon app listens for a custom `drydown_run` event and runs
+# immediately when it fires (see apps/drydown/drydown.py `_on_manual_trigger`).
+# These snippets give you a dashboard button that fires that event.
+#
+# AppDaemon's own `register_service` services are NOT visible in HA's UI, so we
+# go through HA's event bus instead: a script fires the event, and the script
+# is what your dashboard button calls.
+
+# ---------------------------------------------------------------------------
+# 1) Script — fires the `drydown_run` event.
+#
+# Add to your scripts.yaml (or paste the `sequence` into the UI script editor:
+# Settings → Automations & Scenes → Scripts → Add Script → Edit in YAML).
+# This creates the entity `script.drydown_run`.
+# ---------------------------------------------------------------------------
+drydown_run:
+  alias: Run Drydown Now
+  icon: mdi:water-percent
+  mode: single
+  sequence:
+    - event: drydown_run
+      event_data: {}
+
+# ---------------------------------------------------------------------------
+# 2) Dashboard button — calls the script above.
+#
+# Add a Button card to any dashboard (Edit dashboard → Add Card → Manual /
+# "Show code editor") with the YAML below. Pressing it runs the script, which
+# fires `drydown_run`, which the AppDaemon app picks up.
+#
+# type: button
+# name: Run Drydown
+# icon: mdi:water-percent
+# show_state: false
+# tap_action:
+#   action: perform-action          # older HA versions: action: call-service
+#   perform_action: script.drydown_run   # older HA: service: script.drydown_run
+#
+# Alternatively, drop `script.drydown_run` into an Entities card and tap its
+# "RUN" action — no extra config needed.
