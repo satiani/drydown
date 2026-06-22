@@ -4,7 +4,7 @@
 
 A [Home Assistant](https://www.home-assistant.io/) / [AppDaemon](https://appdaemon.readthedocs.io/) app built for Xiaomi-style BLE plant sensors (Mi Flora / HHCC and similar) that expose moisture and conductivity entities. It turns those raw readings into a normalized, per-plant **dryness %** — calibrated from each plant's own watering history, so the same % means the same thing across sensors with different soils, probes, and pot sizes.
 
-It reads moisture/conductivity history from InfluxDB and publishes one HA **device** per plant via [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#discovery). It holds no broker credentials — it publishes through HA's `mqtt.publish` service.
+It reads moisture/conductivity history from InfluxDB and publishes one HA **device** per plant via [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#discovery).
 
 ## What you get per plant
 
@@ -29,7 +29,7 @@ The app detects watering events from moisture jumps and learns each plant's **we
 
 1. **InfluxDB** with your moisture/conductivity history (the HA InfluxDB integration).
 2. **AppDaemon** add-on.
-3. **Mosquitto broker** add-on + HA's **MQTT integration** (the app relays through it, so it needs no broker credentials of its own).
+3. HA's **MQTT integration** with a configured broker.
 
 ## Install
 
