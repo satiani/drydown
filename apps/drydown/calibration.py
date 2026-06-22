@@ -2,7 +2,7 @@
 
 Given a plant's daily-aggregate moisture/conductivity history, this module
 detects watering events, learns a per-plant wet ceiling and dry floor, and
-computes the 0-100 dryness %, drydown slope, ETA, status, and confidence.
+computes the 0-100 dryness %, drydown slope, status, and confidence.
 
 Everything here is deterministic and side-effect free, so it's unit-testable
 without stubbing any I/O. The AppDaemon app (``drydown.py``) owns all I/O and
@@ -74,11 +74,6 @@ class PlantResult:
     wet_ceiling: Optional[float] = None
     dry_floor: Optional[float] = None
     dryness: Optional[int] = None
-    eta_days: Optional[float] = None
-    # Why ETA is non-numeric, when applicable: "rising" or "unknown". Kept
-    # separate from eta_days (which stays strictly numeric|None) so the field
-    # isn't a value/status union; surfaced in logs, not as its own entity.
-    eta_reason: Optional[str] = None
     confidence: str = "uncalibrated"
     status: str = "UNCALIBRATED"
     slope_3d: Optional[float] = None
@@ -189,6 +184,21 @@ def compute_plant(plant_key: str, moisture_entity: str,
     # ---- Detect watering events ----
     events = detect_waterings(mrows, config.jump_threshold)
     result.waterings_detected = len(events)
+
+    # ---- Slope (current dry-down cycle, last 3 readings) ----
+    # Computed before any calibration gating: the drydown rate is meaningful
+    # on its own and useful for uncalibrated plants too (it needs only moisture
+    # readings, not learned bounds). Uses rows since the last detected watering
+    # when one exists, else the whole window.
+    if events:
+        last_event_d = dt.date.fromisoformat(events[-1].date)
+        post = [r for r in mrows
+                if dt.date.fromisoformat(r["t"]) > last_event_d]
+    else:
+        post = list(mrows)
+    slope = slope_over(post, n=3)
+    result.slope_3d = round(slope, 2) if slope is not None else None
+
     if not events:
         return result
 
@@ -223,20 +233,6 @@ def compute_plant(plant_key: str, moisture_entity: str,
     else:
         need = None
     result.dryness = need
-
-    # ---- Slope (current dry-down cycle, last 3 readings) and ETA ----
-    # Only rows since the last detected watering reflect the current dry-down.
-    last_event_d = dt.date.fromisoformat(events[-1].date)
-    post = [r for r in mrows if dt.date.fromisoformat(r["t"]) > last_event_d]
-    slope = slope_over(post, n=3)
-    result.slope_3d = round(slope, 2) if slope is not None else None
-    if slope is not None and slope < 0 and cur_mo is not None:
-        days = (cur_mo - dry_floor) / (-slope)
-        result.eta_days = round(max(0.0, days), 1)
-    elif slope is not None and slope >= 0:
-        result.eta_reason = "rising"
-    else:
-        result.eta_reason = "unknown"
 
     # ---- Status ----
     if need is None:

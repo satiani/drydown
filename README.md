@@ -14,7 +14,6 @@ One device (e.g. "Plant 4 Drydown") with a sensor entity per metric, each with i
 |---|---|---|
 | Dryness | % | 0 = just watered, 100 = water now (the primary output) |
 | Moisture / Conductivity | % / µS/cm | current raw readings |
-| Next Watering Estimate | d | days until water needed |
 | Wet Ceiling / Dry Floor | % | learned calibration bounds |
 | Drydown rate (3d) | %/d | current dry-down rate |
 | Status | — | ok / water soon / WATER NOW / UNCALIBRATED |
@@ -37,6 +36,7 @@ The app detects watering events from moisture jumps and learns each plant's **we
 2. In the AppDaemon add-on's Configuration panel, add `requests` to `python_packages` (see [`appdaemon_config.yaml`](appdaemon_config.yaml)) — the app needs it to query InfluxDB.
 3. Edit `apps/drydown/drydown.yaml` to point at your InfluxDB and list your sensors (each needs a `moisture_entity`; the conductivity entity is derived by swapping `_moisture` for `_conductivity`).
 4. Restart the AppDaemon add-on. Devices appear ~30s after startup.
+5. *(Optional)* For a manual "run now" button in your dashboard, add the script + button card from [`homeassistant/manual_trigger.yaml`](homeassistant/manual_trigger.yaml) (see [Manual trigger](#manual-trigger) below).
 
 For updates, [`scripts/deploy.sh`](scripts/deploy.sh) lints, tests, copies the modules over SSH, restarts the add-on, and verifies a clean run. It never overwrites your live `drydown.yaml`; SSH/host settings are overridable via env vars (see the script header).
 
@@ -45,6 +45,14 @@ For updates, [`scripts/deploy.sh`](scripts/deploy.sh) lints, tests, copies the m
 All options live in [`apps/drydown/drydown.yaml`](apps/drydown/drydown.yaml) (InfluxDB connection, sensors, and detection/confidence tunables) — each is commented. Set `dry_run: true` to compute and log results without publishing.
 
 InfluxDB credentials live in plaintext in `drydown.yaml`. With the default add-on setup these are the non-secret in-network `homeassistant/homeassistant` credentials; if you set real ones, treat the file as a secret.
+
+## Manual trigger
+
+The app runs once ~30s after startup and then hourly. To trigger a run on demand, it also listens for a custom `drydown_run` event on HA's event bus. Fire that event and the app recomputes + republishes immediately.
+
+The quickest way to fire it is **Developer Tools → Events → Fire Event** with event type `drydown_run`. For a clickable **dashboard button**, use the script + Button card in [`homeassistant/manual_trigger.yaml`](homeassistant/manual_trigger.yaml): the script fires the event and the button calls the script.
+
+> Note: AppDaemon's `register_service` services are *not* exposed in HA's UI, so the trigger goes through HA's event bus rather than a HA service.
 
 ## Develop
 

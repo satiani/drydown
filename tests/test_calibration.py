@@ -134,6 +134,34 @@ def test_compute_plant_uncalibrated_with_no_events():
     assert res.waterings_detected == 0
 
 
+def test_compute_plant_slope_shown_when_uncalibrated_no_events():
+    """The drydown rate is meaningful on its own, so it's published even for
+    plants that have never seen a watering (uncalibrated). With a steady
+    decline and no events, the slope is taken over the whole window."""
+    means = [40, 38, 36, 34, 32, 30]
+    mrows = [row(t, m - 1, m + 1, m)
+             for t, m in zip(dates(n=len(means)), means)]
+    res = compute(mrows, cur_mo=30)
+    assert res.confidence == "uncalibrated"
+    assert res.waterings_detected == 0
+    assert res.slope_3d is not None and res.slope_3d == pytest.approx(-2.0)
+
+
+def test_compute_plant_slope_shown_when_uncalibrated_events_none_valid():
+    """Events detected but none valid (no dry-trigger) -> still uncalibrated,
+    yet the current dry-down cycle's slope is published."""
+    means = [42, 41, 40, 39, 47, 45, 44, 43, 42, 41]
+    mins = [m - 1 for m in means]
+    maxs = [m + 1 for m in means]
+    maxs[4] = 50
+    mrows = [row(t, mn, mx, mean)
+             for t, mn, mx, mean in zip(dates(n=len(means)), mins, maxs, means)]
+    res = compute(mrows, cur_mo=41)
+    assert res.confidence == "uncalibrated"
+    assert res.valid_waterings == 0
+    assert res.slope_3d is not None and res.slope_3d < 0
+
+
 def test_compute_plant_uncalibrated_when_events_but_none_valid():
     """Events but no *valid* (dry-trigger) watering -> uncalibrated, NOT 'low'."""
     means = [42, 41, 40, 39, 47, 45, 44, 43, 42, 41]
@@ -210,36 +238,6 @@ def test_compute_plant_slope_excludes_pre_watering_rows():
     ]
     res = compute(mrows, cur_mo=34)
     assert res.slope_3d is None
-
-
-def test_compute_plant_eta_from_slope():
-    seq = [45, 43, 41, 39, 37, 35, 33,
-           15, 45, 43, 41, 39, 37, 35, 33, 31, 29,
-           15, 45, 43, 41, 39, 37, 35, 33, 31]
-    mins = [m - 2 for m in seq]
-    maxs = [m + 2 for m in seq]
-    for wi in (8, 19):
-        maxs[wi] = seq[wi] + 10
-    mrows = [row(t, mn, mx, mean)
-             for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    res = compute(mrows, cur_mo=31)
-    assert res.slope_3d is not None and res.slope_3d == pytest.approx(-2.0)
-    assert isinstance(res.eta_days, float) and res.eta_days >= 0
-    assert res.eta_reason is None
-
-
-def test_compute_plant_eta_reason_rising_keeps_eta_days_none():
-    """When the current cycle's slope is non-negative, eta_days stays None and
-    the reason is 'rising' (no value/status union on eta_days)."""
-    seq = [45, 40, 35, 30, 25, 20, 15, 45, 46, 47, 48]
-    mins = [m - 2 for m in seq]
-    maxs = [m + 2 for m in seq]
-    maxs[7] = seq[7] + 10
-    mrows = [row(t, mn, mx, mean)
-             for t, mn, mx, mean in zip(dates(n=len(seq)), mins, maxs, seq)]
-    res = compute(mrows, cur_mo=48)
-    assert res.eta_days is None
-    assert res.eta_reason == "rising"
 
 
 def test_compute_plant_uses_latest_for_current_moisture():

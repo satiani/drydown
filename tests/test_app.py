@@ -40,7 +40,7 @@ def _result(**kw):
     base = dict(
         plant="p1", moisture_entity="sensor.p1_moisture",
         moisture=20.0, conductivity=100.0, wet_ceiling=45.0, dry_floor=15.0,
-        dryness=67, eta_days=3.5, eta_reason=None, confidence="high",
+        dryness=67, confidence="high",
         status="water soon", slope_3d=-2.0, waterings_detected=4,
         valid_waterings=3)
     base.update(kw)
@@ -53,6 +53,7 @@ class RecordingApp(dd.Drydown):
     def __init__(self):
         self.run_in_calls = []
         self.run_hourly_calls = []
+        self.listen_event_calls = []
         self.logs = []
 
     def log(self, msg, *args, level="INFO", **kwargs):
@@ -63,6 +64,9 @@ class RecordingApp(dd.Drydown):
 
     def run_hourly(self, cb, start=None, **kw):
         self.run_hourly_calls.append(start)
+
+    def listen_event(self, cb, event=None, **kw):
+        self.listen_event_calls.append((event, cb))
 
 
 def base_args(**over):
@@ -85,6 +89,21 @@ def test_initialize_builds_hourly_start_time():
     app.initialize()
     assert app.run_hourly_calls == [dt.time(hour=0, minute=5)]
     assert app.run_in_calls == [30]
+
+
+def test_initialize_registers_manual_trigger_listener():
+    app = RecordingApp()
+    app.args = base_args()
+    app.initialize()
+    assert ("drydown_run", app._on_manual_trigger) in app.listen_event_calls
+
+
+def test_manual_trigger_event_runs_all():
+    app = make_app()
+    ran = []
+    app._run_all = lambda kwargs: ran.append(kwargs)
+    app._on_manual_trigger("drydown_run", {}, {"k": 1})
+    assert ran == [{"k": 1}]
 
 
 def test_initialize_unknown_schedule_type_warns_and_skips_hourly():
@@ -202,7 +221,7 @@ def test_publish_plant_dry_run_does_not_publish():
 def test_publish_plant_publishes_all_payloads_via_service():
     app = make_app()
     app._publish_plant("p1", _result())
-    assert [s for s, _ in app._calls] == ["mqtt/publish"] * 22
+    assert [s for s, _ in app._calls] == ["mqtt/publish"] * 20
     topics = {kw["topic"] for _, kw in app._calls}
     assert "homeassistant/sensor/drydown/p1_dryness/config" in topics
     assert "drydown/p1/dryness/state" in topics

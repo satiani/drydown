@@ -89,6 +89,12 @@ class Drydown(hass.Hass):
         self.run_in(self._run_all, 30)
         self._schedule(cfg.get("schedule", {}))
 
+        # Manual trigger: fire the `drydown_run` event in HA (e.g. from a
+        # dashboard button via a script) to run immediately. This stays
+        # event-driven, so the app still reads nothing from HA's state machine.
+        self.listen_event(self._on_manual_trigger, "drydown_run")
+        self.log("drydown: manual trigger listening for 'drydown_run' event")
+
         if self.dry_run:
             self.log("drydown DRY RUN enabled — nothing will be published")
 
@@ -108,6 +114,16 @@ class Drydown(hass.Hass):
         self.log("drydown scheduled: hourly at :%02d", start.minute)
 
     # ---- Orchestration ------------------------------------------------------
+
+    def _on_manual_trigger(self, event_name: str, data: dict[str, Any],
+                           kwargs: Any) -> None:
+        """Run immediately when the `drydown_run` HA event fires.
+
+        Lets a dashboard button (wired to a script that fires this event)
+        trigger a run on demand, without waiting for the hourly schedule.
+        """
+        self.log("drydown: manual trigger received via '%s' event", event_name)
+        self._run_all(kwargs)
 
     def _run_all(self, kwargs: Any) -> None:
         """Pull history (+ latest) from InfluxDB, compute per-plant, publish."""
@@ -170,11 +186,9 @@ class Drydown(hass.Hass):
             return
         for topic, payload, retain in publish.build_payloads(plant_key, result):
             self._mqtt_publish(topic, payload, retain=retain)
-        self.log("drydown %s: dryness=%s wet=%s dry=%s conf=%s eta=%s",
+        self.log("drydown %s: dryness=%s wet=%s dry=%s conf=%s",
                  plant_key, result.dryness, result.wet_ceiling,
-                 result.dry_floor, result.confidence,
-                 result.eta_days if result.eta_days is not None
-                 else result.eta_reason)
+                 result.dry_floor, result.confidence)
 
     def _mqtt_publish(self, topic: str, payload: str, retain: bool = False) -> None:
         """Publish via HA's mqtt.publish service over the websocket.
