@@ -11,6 +11,9 @@ venv/
 .coverage
 htmlcov/
 
+# Agent notes (local only)
+agents.md
+
 # Editor / OS
 .DS_Store
 *.swp
