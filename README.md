@@ -50,6 +50,8 @@ InfluxDB credentials live in plaintext in `drydown.yaml`. With the default add-o
 
 The app runs once ~30s after startup and then hourly. To trigger a run on demand, it also listens for a custom `drydown_run` event on HA's event bus. Fire that event and the app recomputes + republishes immediately.
 
+Every discovery config sets MQTT `force_update: true`, so each hourly run writes **one InfluxDB point per indicator** even when a value is unchanged — without it, HA suppresses `state_changed` for identical states and the InfluxDB integration records nothing, so a steady reading (e.g. dryness held at 81 for hours) would leave gaps in the history. Existing entities pick up the flag from the next discovery republish; if a value still won't record hourly, reload the MQTT integration.
+
 The quickest way to fire it is **Developer Tools → Events → Fire Event** with event type `drydown_run`. For a clickable **dashboard button**, use the script + Button card in [`homeassistant/manual_trigger.yaml`](homeassistant/manual_trigger.yaml): the script fires the event and the button calls the script.
 
 > Note: AppDaemon's `register_service` services are *not* exposed in HA's UI, so the trigger goes through HA's event bus rather than a HA service.

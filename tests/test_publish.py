@@ -61,6 +61,15 @@ def test_payloads_uncalibrated_publishes_empty_numeric_states():
     assert st["drydown/p2/waterings_detected/state"] == "0"
 
 
+def test_payloads_force_update_on_every_discovery():
+    """Every discovery config sets force_update so a steady reading still
+    produces one InfluxDB point per hourly publish (HA otherwise dedups
+    unchanged states and the InfluxDB integration records nothing)."""
+    for t, p, _ in publish.build_payloads("plant_4", _result()):
+        if t.endswith("/config"):
+            assert json.loads(p)["force_update"] is True, t
+
+
 def test_payloads_entity_names_and_units():
     configs = {}
     for t, p, _ in publish.build_payloads("p1", _result()):

@@ -4,6 +4,11 @@ Builds the (topic, payload, retain) messages for one plant — one retained
 discovery config + one retained state per metric — with no I/O, so it's
 unit-testable without a broker. The AppDaemon app calls :func:`build_payloads`
 and relays each message through HA's ``mqtt.publish`` service.
+
+Every discovery config sets ``force_update: true``: HA otherwise suppresses
+``state_changed`` for identical states, and the InfluxDB integration records
+only on ``state_changed``, so a steady reading would write no points. With
+``force_update`` each hourly publish yields one InfluxDB point per indicator.
 """
 
 from __future__ import annotations
@@ -75,6 +80,14 @@ def build_payloads(plant_key: str,
             "uniq_id": "drydown_%s_%s" % (plant_key, obj),
             "stat_t": state_topic,
             "dev": dev,
+            # Force HA to fire a state_changed event on every received state
+            # message even when the value is unchanged. HA's state machine
+            # otherwise suppresses identical states, and since the InfluxDB
+            # integration only records on state_changed, a steady reading (e.g.
+            # dryness held at 81 for hours) would write no points. With
+            # force_update, each hourly publish yields exactly one InfluxDB
+            # point per indicator — giving continuous per-hour history.
+            "force_update": True,
         }
         for ck, cv in (("dev_cla", "dev_cla"), ("unit", "unit_of_meas"),
                        ("stat_cla", "stat_cla"), ("icon", "icon")):
